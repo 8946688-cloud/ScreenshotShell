@@ -1,1 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key> <string>PSGroupCell</string>
+            <key>label</key> <string>全局开关</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSSwitchCell</string>
+            <key>default</key> <false/>
+            <key>defaults</key> <string>com.iosdump.screenshotshell</string>
+            <key>key</key> <string>Enabled</string>
+            <key>label</key> <string>开启套壳功能</string>
+            <key>PostNotification</key> <string>com.iosdump.screenshotshell/ReloadPrefs</string>
+        </dict>
+        
+        <dict>
+            <key>cell</key> <string>PSGroupCell</string>
+            <key>label</key> <string>外壳素材</string>
+            <key>footerText</key> <string>请选择一张中间透明的手机壳PNG图片</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSButtonCell</string>
+            <key>label</key> <string>选择外壳图片</string>
+            <key>action</key> <string>chooseShellImage</string>
+            <key>id</key> <string>shellImageBtn</string>
+        </dict>
 
+        <dict>
+            <key>cell</key> <string>PSGroupCell</string>
+            <key>label</key> <string>截图内嵌坐标与尺寸 (px)</string>
+            <key>footerText</key> <string>设定原始截图应该画在外壳图片的哪个位置和大小。</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSEditTextCell</string>
+            <key>default</key> <string>50</string>
+            <key>defaults</key> <string>com.iosdump.screenshotshell</string>
+            <key>key</key> <string>RectX</string>
+            <key>label</key> <string>X 坐标</string>
+            <key>keyboard</key> <string>phone</string>
+            <key>PostNotification</key> <string>com.iosdump.screenshotshell/ReloadPrefs</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSEditTextCell</string>
+            <key>default</key> <string>50</string>
+            <key>defaults</key> <string>com.iosdump.screenshotshell</string>
+            <key>key</key> <string>RectY</string>
+            <key>label</key> <string>Y 坐标</string>
+            <key>keyboard</key> <string>phone</string>
+            <key>PostNotification</key> <string>com.iosdump.screenshotshell/ReloadPrefs</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSEditTextCell</string>
+            <key>default</key> <string>1170</string>
+            <key>defaults</key> <string>com.iosdump.screenshotshell</string>
+            <key>key</key> <string>RectW</string>
+            <key>label</key> <string>宽度 (Width)</string>
+            <key>keyboard</key> <string>phone</string>
+            <key>PostNotification</key> <string>com.iosdump.screenshotshell/ReloadPrefs</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSEditTextCell</string>
+            <key>default</key> <string>2532</string>
+            <key>defaults</key> <string>com.iosdump.screenshotshell</string>
+            <key>key</key> <string>RectH</string>
+            <key>label</key> <string>高度 (Height)</string>
+            <key>keyboard</key> <string>phone</string>
+            <key>PostNotification</key> <string>com.iosdump.screenshotshell/ReloadPrefs</string>
+        </dict>
+    </array>
+    <key>title</key>
+    <string>截图套壳</string>
+</dict>
+</plist>
