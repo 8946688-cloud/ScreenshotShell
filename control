@@ -1,1 +1,9 @@
-
+Package: com.iosdump.screenshotshell
+Name: ScreenshotShell
+Depends: mobilesubstrate, preferenceloader
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: iOS 14-17 截图完美自动套壳
+Maintainer: iosdump
+Author: iosdump
+Section: Tweaks
