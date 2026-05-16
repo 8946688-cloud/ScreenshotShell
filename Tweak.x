@@ -7,24 +7,24 @@
 #define jbroot(path) path
 #endif
 
-// ============================================
-// 1. 补齐私有头文件声明 (基于你提供的 dump)
-// ============================================
+// --------------------------------------------------------
+// 声明私有头文件 (粉碎截图缓存的必要组件)
+// --------------------------------------------------------
 @interface SSEnvironmentDescription : NSObject
 @property (nonatomic) CGSize imagePixelSize;
 @property (nonatomic) double imageScale;
-- (void)setImageSurface:(id)surface; // 核心：用来破坏硬件缓存
+- (void)setImageSurface:(id)surface; 
 @end
 
 @interface SSSScreenshot : NSObject
 @property (readonly, nonatomic) SSEnvironmentDescription *environmentDescription;
 @end
 
-// ============================================
-// 2. 路径辅助与配置读取
-// ============================================
-static NSString * GetSharedSupportDir() {
-    NSString *base = @"/Library/Application Support/ScreenshotShell";
+// --------------------------------------------------------
+// 路径辅助 (完全恢复为你最初的要求)
+// --------------------------------------------------------
+static NSString * GetPrefDir() {
+    NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.screenshotshell.media";
 #if __has_include(<roothide.h>)
     return jbroot(base);
 #else
@@ -35,28 +35,29 @@ static NSString * GetSharedSupportDir() {
 #endif
 }
 
-// 安全读取总开关
-static BOOL isTweakEnabled() {
-    CFStringRef appID = CFSTR("com.iosdump.screenshotshell");
-    CFPreferencesAppSynchronize(appID);
-    Boolean valid = NO;
-    BOOL enabled = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), appID, &valid);
-    return valid ? enabled : NO;
+static NSString * GetPlistPath() {
+    NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.screenshotshell.plist";
+#if __has_include(<roothide.h>)
+    return jbroot(base);
+#else
+    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/"]) {
+        return [@"/var/jb" stringByAppendingPathComponent:base];
+    }
+    return base;
+#endif
 }
 
-// ============================================
-// 3. 核心合成逻辑 (使用 CFG 计算坐标与缩放)
-// ============================================
+// --------------------------------------------------------
+// 核心：读取 JSON cfg 并合成图片
+// --------------------------------------------------------
 static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
     
-    // 读取素材
-    NSString *shellPath = [GetSharedSupportDir() stringByAppendingPathComponent:@"shell.png"];
+    NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
     UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
     if (!shellImage) return rawScreenshot; 
     
-    // 读取 CFG
-    NSString *cfgPath = [GetSharedSupportDir() stringByAppendingPathComponent:@"config.cfg"];
+    NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
     NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
     if (!cfgData) return rawScreenshot; 
     
@@ -64,7 +65,6 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:kNilOptions error:&error];
     if (!cfg || error) return rawScreenshot;
     
-    // 解析坐标
     CGFloat leftTopX = [cfg[@"left_top_x"] floatValue];
     CGFloat leftTopY = [cfg[@"left_top_y"] floatValue];
     CGFloat rightTopX = [cfg[@"right_top_x"] floatValue];
@@ -76,16 +76,11 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     CGFloat templateW = [cfg[@"template_width"] floatValue];
     CGFloat templateH = [cfg[@"template_height"] floatValue];
     
-    // 计算缩放比例 (以防外壳 png 的实际分辨率与 cfg 中定义的不一致)
     CGFloat scaleX = (templateW > 0) ? (shellImage.size.width / templateW) : 1.0;
     CGFloat scaleY = (templateH > 0) ? (shellImage.size.height / templateH) : 1.0;
     
-    CGRect innerRect = CGRectMake(leftTopX * scaleX, 
-                                  leftTopY * scaleY, 
-                                  rawW * scaleX, 
-                                  rawH * scaleY);
+    CGRect innerRect = CGRectMake(leftTopX * scaleX, leftTopY * scaleY, rawW * scaleX, rawH * scaleY);
     
-    // 开始绘制
     UIGraphicsBeginImageContextWithOptions(shellImage.size, NO, 0.0);
     [rawScreenshot drawInRect:innerRect];
     [shellImage drawInRect:CGRectMake(0, 0, shellImage.size.width, shellImage.size.height)];
@@ -95,31 +90,40 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     return finalImage ?: rawScreenshot;
 }
 
-// ============================================
-// 4. Hook 截图服务 (基于最新的头文件机制)
-// ============================================
+// --------------------------------------------------------
+// 核心：将【套壳后】的图片静默保存到系统相册
+// --------------------------------------------------------
+static void saveShelledScreenshotToPhotos(UIImage *shelledImage) {
+    if (!shelledImage) return;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+            [PHAssetChangeRequest creationRequestForAssetFromImage:shelledImage];
+        } completionHandler:nil];
+    });
+}
+
+// --------------------------------------------------------
+// Hook ScreenshotServicesService
+// --------------------------------------------------------
 %group ScreenshotServiceHook
 
 %hook SSSScreenshot
 - (void)setBackingImage:(UIImage *)image {
-    if (image && isTweakEnabled()) {
-        
-        // 可选：静默保存不带壳的原图到相册（如有需要，解开下行注释）
-        // UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil);
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
+    if (image && prefs && [prefs[@"Enabled"] boolValue]) {
         
         UIImage *shelledImage = applyShellToScreenshot(image);
         if (shelledImage && shelledImage != image) {
             
-            // 🚨 核心破解步骤：获取环境对象
-            SSEnvironmentDescription *env = [self environmentDescription];
+            // 1. 静默保存【套壳后的图片】到相册
+            saveShelledScreenshotToPhotos(shelledImage);
             
+            // 2. 核心破解：粉碎底层的原图缓存，逼迫系统展示套壳图
+            SSEnvironmentDescription *env = [self environmentDescription];
             if (env) {
-                // 1. 抹除硬件层面的截图缓存，逼迫系统使用我们的 UIImage
                 if ([env respondsToSelector:@selector(setImageSurface:)]) {
                     [env setImageSurface:nil];
                 }
-                
-                // 2. 修正悬浮窗/编辑器里的画布尺寸，防止套壳图被拉伸或裁剪
                 if ([env respondsToSelector:@selector(setImagePixelSize:)]) {
                     [env setImagePixelSize:shelledImage.size];
                 }
@@ -128,27 +132,29 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
                 }
             }
             
-            // 最终将套好壳的图片交给系统
             %orig(shelledImage);
             return;
         }
     }
-    
     %orig(image);
 }
 %end
 
 %end // ScreenshotServiceHook
 
-// ============================================
-// 5. 保底：Hook SpringBoard (处理 iOS 某些边缘触发情况)
-// ============================================
+// --------------------------------------------------------
+// 保底 Hook SpringBoard
+// --------------------------------------------------------
 %group SpringBoardHook
+
 %hook SSUIShowScreenshotUIWithImageServiceRequest
 - (void)setImage:(UIImage *)image {
-    if (image && isTweakEnabled()) {
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
+    if (image && prefs && [prefs[@"Enabled"] boolValue]) {
         UIImage *shelledImage = applyShellToScreenshot(image);
-        if (shelledImage) {
+        if (shelledImage && shelledImage != image) {
+            // SpringBoard 层也触发相册保存
+            saveShelledScreenshotToPhotos(shelledImage);
             %orig(shelledImage);
             return;
         }
@@ -156,11 +162,12 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     %orig(image);
 }
 %end
+
 %end // SpringBoardHook
 
-// ============================================
-// 6. 构造入口
-// ============================================
+// --------------------------------------------------------
+// 构造入口
+// --------------------------------------------------------
 %ctor {
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
     if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"]) {
