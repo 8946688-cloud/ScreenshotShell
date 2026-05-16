@@ -151,17 +151,22 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
 
 
 // ============================================
-// 5. 构造入口，分配进程
+// 5. 构造入口，分配进程 (修复版)
 // ============================================
 %ctor {
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
     NSLog(@"[ScreenshotShell] 💉 插件已成功注入进程: %@", bundleId);
     
-    // 无论是截图悬浮窗服务，还是 SpringBoard 直接保存，我们都在它们的相册写入接口设下埋伏
-    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"]) {
+    // 合并判断条件：只要是这两个进程之一，就初始化保存拦截模块
+    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"] || 
+        [bundleId isEqualToString:@"com.apple.springboard"]) {
+        
+        // 整个文件中只写一次 %init，完美绕过 Logos 编译器的重复定义检查！
         %init(UltimateSaveHook);
-        %init(UIObserverHook);
-    } else if ([bundleId isEqualToString:@"com.apple.springboard"]) {
-        %init(UltimateSaveHook);
+        
+        // 只有在悬浮窗服务里，才额外加载悬浮窗日志追踪
+        if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"]) {
+            %init(UIObserverHook);
+        }
     }
 }
