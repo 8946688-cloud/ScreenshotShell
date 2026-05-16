@@ -11,7 +11,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = ScreenshotShell
 ScreenshotShell_FILES = Tweak.x
 ScreenshotShell_CFLAGS = -fobjc-arc
-ScreenshotShell_FRAMEWORKS = UIKit CoreGraphics
+ScreenshotShell_FRAMEWORKS = UIKit CoreGraphics CoreImage
 ScreenshotShell_EXTRA_FRAMEWORKS = Photos
 
 include $(THEOS_MAKE_PATH)/tweak.mk
