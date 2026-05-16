@@ -11,10 +11,12 @@
 // 声明私有头文件
 // --------------------------------------------------------
 @interface SSEnvironmentDescription : NSObject
-- (void)setImageSurface:(id)surface; 
+@property (nonatomic) CGSize imagePixelSize;
+@property (nonatomic) double imageScale;
 @end
 
 @interface SSSScreenshot : NSObject
+@property (retain, nonatomic) UIImage *backingImage;
 @property (readonly, nonatomic) SSEnvironmentDescription *environmentDescription;
 @end
 
@@ -46,86 +48,80 @@ static NSString * GetPlistPath() {
 }
 
 // --------------------------------------------------------
-// 核心：终极透明画布 + 倒推尺寸算法 (防裁剪缝隙)
+// 核心：基于四角坐标与四舍五入的完美透明渲染算法
 // --------------------------------------------------------
 static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
     
-    // ⚠️ 防死循环：如果图片已经套过壳，直接返回
+    // ⚠️ 防死循环标记，保证只套壳一次
     if ([rawScreenshot.accessibilityIdentifier isEqualToString:@"ScreenshotShell_Done"]) {
         return rawScreenshot;
     }
-    
-    __block UIImage *finalImage = nil;
-    
-    @autoreleasepool {
-        NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
-        UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
-        if (!shellImage) return rawScreenshot; 
-        
-        NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
-        NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
-        if (!cfgData) return rawScreenshot; 
-        
-        NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:kNilOptions error:nil];
-        if (!cfg) return rawScreenshot;
-        
-        // 1. 获取原截图真实的物理像素尺寸
-        CGFloat rawW = rawScreenshot.size.width * rawScreenshot.scale;
-       // CGFloat rawH = rawScreenshot.size.height * rawScreenshot.scale;
-        
-        CGFloat templateW = [cfg[@"template_width"] floatValue];
-        CGFloat templateH = [cfg[@"template_height"] floatValue];
-        
-        // CFG 内部窟窿坐标
-        CGFloat ltx = [cfg[@"left_top_x"] floatValue];
-        CGFloat lty = [cfg[@"left_top_y"] floatValue];
-        CGFloat rtx = [cfg[@"right_top_x"] floatValue];
-        CGFloat lby = [cfg[@"left_bottom_y"] floatValue];
-        
-        CGFloat innerW = rtx - ltx;
-        CGFloat innerH = lby - lty;
-        if (innerW <= 0 || innerH <= 0) return rawScreenshot;
 
-        // 2. ⚠️ 终极数学对齐：用截图大小倒推外壳需要缩放的比例
-        // 确保外壳缩小后，中间的窟窿刚好等于截图的宽度
-        CGFloat scale = rawW / innerW;
-        
-        CGFloat canvasW = templateW * scale;
-        CGFloat canvasH = templateH * scale;
-        
-        CGFloat drawX = ltx * scale;
-        CGFloat drawY = lty * scale;
-        CGFloat drawW = innerW * scale;
-        CGFloat drawH = innerH * scale;
-        
-        // 3. ⚠️ 开启纯透明的底层画板，根除原本变成实心的问题！
-        UIGraphicsBeginImageContextWithOptions(CGSizeMake(canvasW, canvasH), NO, 1.0);
-        CGContextRef context = UIGraphicsGetCurrentContext();
-        CGContextClearRect(context, CGRectMake(0, 0, canvasW, canvasH));
-        
-        // 底层：将截图精确填入算好的窟窿区域（使用 drawW 和 drawH 防白边）
-        [rawScreenshot drawInRect:CGRectMake(drawX, drawY, drawW, drawH)];
-        
-        // 顶层：盖上手机壳（因为底板是透明的，天然镂空处自然透出原图）
-        [shellImage drawInRect:CGRectMake(0, 0, canvasW, canvasH)];
-        
-        UIImage *renderedImage = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
-        
-        if (renderedImage && renderedImage.CGImage) {
-            // 重新赋予原始高清 Scale 和正向旋转，防黑屏
-            finalImage = [UIImage imageWithCGImage:renderedImage.CGImage scale:rawScreenshot.scale orientation:UIImageOrientationUp];
-            // 打上标记，防止系统重复调用导致二次套壳
-            finalImage.accessibilityIdentifier = @"ScreenshotShell_Done";
-        }
+    NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
+    UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
+    if (!shellImage) return rawScreenshot;
+
+    NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
+    NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
+    if (!cfgData) return rawScreenshot;
+
+    NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:0 error:nil];
+    if (![cfg isKindOfClass:[NSDictionary class]]) return rawScreenshot;
+
+    CGFloat rawW = rawScreenshot.size.width * rawScreenshot.scale;
+    CGFloat rawH = rawScreenshot.size.height * rawScreenshot.scale;
+
+    CGFloat templateW = [cfg[@"template_width"] doubleValue];
+    CGFloat templateH = [cfg[@"template_height"] doubleValue];
+
+    CGFloat ltx = [cfg[@"left_top_x"] doubleValue];
+    CGFloat lty = [cfg[@"left_top_y"] doubleValue];
+    CGFloat rtx = [cfg[@"right_top_x"] doubleValue];
+    CGFloat rty = [cfg[@"right_top_y"] doubleValue];
+    CGFloat lbx = [cfg[@"left_bottom_x"] doubleValue];
+    CGFloat lby = [cfg[@"left_bottom_y"] doubleValue];
+    CGFloat rbx = [cfg[@"right_bottom_x"] doubleValue];
+    CGFloat rby = [cfg[@"right_bottom_y"] doubleValue];
+
+    // 计算内部洞的实际宽和高
+    CGFloat holeW = rtx - ltx;
+    CGFloat holeH = lby - lty;
+    if (holeW <= 0 || holeH <= 0) return rawScreenshot;
+
+    CGFloat scaleX = rawW / holeW;
+    CGFloat scaleY = rawH / holeH;
+    CGFloat scale = MIN(scaleX, scaleY);
+
+    // ⚠️ 关键点：统一使用 round 取整，防止出现半像素抗锯齿导致的黑白边缝隙
+    CGFloat canvasW = round(templateW * scale);
+    CGFloat canvasH = round(templateH * scale);
+
+    CGFloat drawX = round(ltx * scale);
+    CGFloat drawY = round(lty * scale);
+    CGFloat drawW = round(holeW * scale);
+    CGFloat drawH = round(holeH * scale);
+
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(canvasW, canvasH), NO, 1.0);
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    CGContextClearRect(ctx, CGRectMake(0, 0, canvasW, canvasH));
+
+    [rawScreenshot drawInRect:CGRectMake(drawX, drawY, drawW, drawH)];
+    [shellImage drawInRect:CGRectMake(0, 0, canvasW, canvasH)];
+
+    UIImage *renderedImage = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+
+    if (renderedImage) {
+        renderedImage.accessibilityIdentifier = @"ScreenshotShell_Done";
     }
-    
-    return finalImage ?: rawScreenshot;
+
+    // ⚠️ 关键点：不再二次包一层 scale，直接原封不动返回当前画出来的纯净图片对象
+    return renderedImage ?: rawScreenshot;
 }
 
 // --------------------------------------------------------
-// Hook 核心：回归你最完美、最原版的第一版拦截方案！
+// Hook 核心：回归稳定版拦截，去除多余操作
 // --------------------------------------------------------
 %group ScreenshotCoreHook
 
@@ -137,13 +133,8 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
         UIImage *shelledImage = applyShellToScreenshot(image);
         if (shelledImage && shelledImage != image) {
             
+            // ⚠️ 关键点：直接覆盖原图交给系统，不再调用 setImageSurface:nil 导致整个 UI 图层消失！
             %orig(shelledImage);
-            
-            // 释放原生表面裁剪约束，防止编辑器白屏
-            SSEnvironmentDescription *envDesc = [self environmentDescription];
-            if (envDesc && [envDesc respondsToSelector:@selector(setImageSurface:)]) {
-                [envDesc setImageSurface:nil];
-            }
             return;
         }
     }
@@ -161,7 +152,6 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
         if (rawImage) {
             UIImage *shelled = applyShellToScreenshot(rawImage);
             if (shelled && shelled != rawImage) {
-                // ⚠️ 极其关键：必须转 PNG 保证相册存进去是透明的
                 NSData *shelledData = UIImagePNGRepresentation(shelled);
                 if (shelledData) {
                     %orig(type, shelledData, options);
@@ -182,7 +172,7 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
             if (shelled && shelled != rawImage) {
                 NSData *shelledData = UIImagePNGRepresentation(shelled);
                 if (shelledData) {
-                    // 回归你原版最完美的临时文件“狸猫换太子”，这个方案在你的机器上是绝对合法的！
+                    // 使用最稳妥的临时文件大法，保证权限无懈可击
                     NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
                     tempPath = [tempPath stringByAppendingPathExtension:@"png"];
                     [shelledData writeToFile:tempPath atomically:YES];
@@ -206,7 +196,6 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
 // --------------------------------------------------------
 %ctor {
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
-    // 覆盖悬浮窗和主屏幕（滑动隐藏时保存进程在 SB）
     if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"] ||
         [bundleId isEqualToString:@"com.apple.springboard"]) {
         %init(ScreenshotCoreHook);
