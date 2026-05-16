@@ -1,3 +1,4 @@
+
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
 
@@ -11,13 +12,10 @@
 // 声明私有头文件
 // --------------------------------------------------------
 @interface SSEnvironmentDescription : NSObject
-@property (nonatomic) CGSize imagePixelSize;
-@property (nonatomic) double imageScale;
 - (void)setImageSurface:(id)surface; 
 @end
 
 @interface SSSScreenshot : NSObject
-@property (retain, nonatomic) UIImage *backingImage;
 @property (readonly, nonatomic) SSEnvironmentDescription *environmentDescription;
 @end
 
@@ -49,35 +47,7 @@ static NSString * GetPlistPath() {
 }
 
 // --------------------------------------------------------
-// 独立保存方法 (⚠️已修复透明通道丢失问题)
-// --------------------------------------------------------
-static void saveShelledScreenshotToPhotos(UIImage *shelledImage) {
-    if (!shelledImage) return;
-    
-    // ⚠️ 极其关键：必须转成 PNG Data 才能保住透明通道，直接存 UIImage 会被系统强转为不透明的 JPG！
-    NSData *pngData = UIImagePNGRepresentation(shelledImage);
-    if (!pngData) {
-        NSLog(@"[ScreenshotShell] :::::::::::::::::::: ❌ 失败：PNG 转换失败");
-        return;
-    }
-    
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
-            // 改为通过 Data 创建资源库对象，完美保留 PNG 透明度
-            PHAssetCreationRequest *request = [PHAssetCreationRequest creationRequestForAsset];
-            [request addResourceWithType:PHAssetResourceTypePhoto data:pngData options:nil];
-        } completionHandler:^(BOOL success, NSError *error) {
-            if (success) {
-                NSLog(@"[ScreenshotShell] :::::::::::::::::::: 💾 成功：透明 PNG 套壳图已保存到相册！");
-            } else {
-                NSLog(@"[ScreenshotShell] :::::::::::::::::::: ❌ 失败：相册保存报错 -> %@", error);
-            }
-        }];
-    });
-}
-
-// --------------------------------------------------------
-// 核心：合成套壳图 (⚠️已修复截图不见了的问题)
+// 核心：基于原屏幕尺寸的完美透明渲染算法
 // --------------------------------------------------------
 static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) {
@@ -105,130 +75,155 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
         NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:kNilOptions error:nil];
         if (!cfg) return rawScreenshot;
         
+        // 1. 获取原截图的真实像素尺寸（保持这个画布大小，系统UI才绝对不会乱裁剪！）
+        CGFloat rawW = rawScreenshot.size.width * rawScreenshot.scale;
+        CGFloat rawH = rawScreenshot.size.height * rawScreenshot.scale;
+        
         CGFloat templateW = [cfg[@"template_width"] floatValue];
         CGFloat templateH = [cfg[@"template_height"] floatValue];
-        if (templateW <= 0 || templateH <= 0) return rawScreenshot;
+        if (templateW <= 0 || templateH <= 0) {
+            templateW = shellImage.size.width;
+            templateH = shellImage.size.height;
+        }
         
-        CGFloat pixelW = shellImage.size.width;
-        CGFloat pixelH = shellImage.size.height;
+        // 2. 计算外壳缩放比例 (将巨大的外壳等比缩小，刚好塞进手机屏幕的画布里)
+        CGFloat scaleX = rawW / templateW;
+        CGFloat scaleY = rawH / templateH;
+        CGFloat shellScale = MIN(scaleX, scaleY);
         
-        CGFloat scaleX = pixelW / templateW;
-        CGFloat scaleY = pixelH / templateH;
+        CGFloat finalShellW = templateW * shellScale;
+        CGFloat finalShellH = templateH * shellScale;
         
-        // 提取 4 个点
-        CGFloat ltx = [cfg[@"left_top_x"] floatValue];
-        CGFloat lty = [cfg[@"left_top_y"] floatValue];
-        CGFloat rtx = [cfg[@"right_top_x"] floatValue];
-        CGFloat rty = [cfg[@"right_top_y"] floatValue];
-        CGFloat lbx = [cfg[@"left_bottom_x"] floatValue];
-        CGFloat lby = [cfg[@"left_bottom_y"] floatValue];
-        CGFloat rbx = [cfg[@"right_bottom_x"] floatValue];
-        CGFloat rby = [cfg[@"right_bottom_y"] floatValue];
+        // 居中外壳
+        CGFloat shellX = (rawW - finalShellW) / 2.0;
+        CGFloat shellY = (rawH - finalShellH) / 2.0;
         
-        // 核心算法：计算最大外接矩形 (Bounding Box)
-        CGFloat minX = MIN(ltx, lbx) * scaleX;
-        CGFloat minY = MIN(lty, rty) * scaleY;
-        CGFloat maxX = MAX(rtx, rbx) * scaleX;
-        CGFloat maxY = MAX(lby, rby) * scaleY;
+        // 3. 计算出缩小后的窟窿位置
+        CGFloat ltx = [cfg[@"left_top_x"] floatValue] * shellScale;
+        CGFloat lty = [cfg[@"left_top_y"] floatValue] * shellScale;
+        CGFloat rtx = [cfg[@"right_top_x"] floatValue] * shellScale;
+        CGFloat lby = [cfg[@"left_bottom_y"] floatValue] * shellScale;
         
-        CGRect innerRect = CGRectMake(minX, minY, maxX - minX, maxY - minY);
+        CGFloat innerX = shellX + ltx;
+        CGFloat innerY = shellY + lty;
+        CGFloat innerW = rtx - ltx;
+        CGFloat innerH = lby - lty;
         
-        NSLog(@"[ScreenshotShell] :::::::::::::::::::: ⚙️ 原图大小: %.1f x %.1f", rawScreenshot.size.width, rawScreenshot.size.height);
-        NSLog(@"[ScreenshotShell] :::::::::::::::::::: ⚙️ 画布大小: %.1f x %.1f", pixelW, pixelH);
-        NSLog(@"[ScreenshotShell] :::::::::::::::::::: ⚙️ 截图将画在: %@", NSStringFromCGRect(innerRect));
+        NSLog(@"[ScreenshotShell] :::::::::::::::::::: ⚙️ 画布尺寸: %.1f x %.1f", rawW, rawH);
+        NSLog(@"[ScreenshotShell] :::::::::::::::::::: ⚙️ 外壳缩小至: %.1f x %.1f", finalShellW, finalShellH);
+        NSLog(@"[ScreenshotShell] :::::::::::::::::::: ⚙️ 截图将被压缩在: %@", NSStringFromCGRect(CGRectMake(innerX, innerY, innerW, innerH)));
         
-        // ⚠️ 极其关键修复：废弃 Renderer，改用最稳定的上下文引擎
-        // 参数 NO 表示透明背景，1.0 比例防内存爆炸
-        UIGraphicsBeginImageContextWithOptions(CGSizeMake(pixelW, pixelH), NO, 1.0);
+        // 4. ⚠️ 终极杀招：使用原始的上下文 API 彻底根除黑/白底！参数 NO 代表透明画布！
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(rawW, rawH), NO, 1.0);
         CGContextRef context = UIGraphicsGetCurrentContext();
-        CGContextClearRect(context, CGRectMake(0, 0, pixelW, pixelH)); // 清空画布底色
+        CGContextClearRect(context, CGRectMake(0, 0, rawW, rawH));
         
-        // 底层：画出截图 (drawInRect会自动纠正截图原本乱七八糟的朝向)
-        [rawScreenshot drawInRect:innerRect];
+        // 底层：把你的屏幕截图，挤压填进算好的窟窿里
+        [rawScreenshot drawInRect:CGRectMake(innerX, innerY, innerW, innerH)];
         
-        // 顶层：盖上手机壳
-        [shellImage drawInRect:CGRectMake(0, 0, pixelW, pixelH)];
+        // 顶层：盖上手机外壳（因为画布是透明的，窟窿也是透明的，所以刚好能漏出底下的截图！）
+        [shellImage drawInRect:CGRectMake(shellX, shellY, finalShellW, finalShellH)];
         
         UIImage *renderedImage = UIGraphicsGetImageFromCurrentImageContext();
         UIGraphicsEndImageContext();
         
         if (renderedImage && renderedImage.CGImage) {
-            // ⚠️ 极其关键修复2：Orientation 必须强锁 UIImageOrientationUp，否则图片会在后台被双重旋转抛出屏幕外！
+            // 重新赋予原始 Scale 和 方向，完美骗过系统
             finalImage = [UIImage imageWithCGImage:renderedImage.CGImage scale:rawScreenshot.scale orientation:UIImageOrientationUp];
-        } else {
-            finalImage = renderedImage;
+            NSLog(@"[ScreenshotShell] :::::::::::::::::::: 🎉 图片内存合成完毕！");
         }
     }
     
-    if (finalImage) {
-        NSLog(@"[ScreenshotShell] :::::::::::::::::::: 🎉 图片内存合成完毕！");
-    }
     return finalImage ?: rawScreenshot;
 }
 
 // --------------------------------------------------------
-// 源头狙击钩子：SSSScreenshotManager
+// Hook 核心：退回原汁原味的拦截点 (告别双重保存的诡异BUG)
 // --------------------------------------------------------
-%group SourceSniperHook
+%group ScreenshotCoreHook
 
-%hook SSSScreenshotManager
-
-- (id)createScreenshotWithEnvironmentDescription:(id)env {
-    NSLog(@"[ScreenshotShell] :::::::::::::::::::: 🚀 触发拦截：接收到截图环境包!");
-    
-    SSSScreenshot *screenshot = %orig(env);
-    
+// 1. 替换左下角 UI 显示
+%hook SSSScreenshot
+- (void)setBackingImage:(UIImage *)image {
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
-    if (screenshot && prefs && [prefs[@"Enabled"] boolValue]) {
-        
-        UIImage *rawImage = [screenshot backingImage];
-        if (rawImage) {
-            NSLog(@"[ScreenshotShell] :::::::::::::::::::: 🔍 成功提取出原图，准备套壳...");
-            UIImage *shelledImage = applyShellToScreenshot(rawImage);
+    if (image && prefs && [prefs[@"Enabled"] boolValue]) {
+        NSLog(@"[ScreenshotShell] :::::::::::::::::::: 🚀 触发编辑器 UI 替换");
+        UIImage *shelledImage = applyShellToScreenshot(image);
+        if (shelledImage && shelledImage != image) {
+            %orig(shelledImage);
             
-            if (shelledImage && shelledImage != rawImage) {
-                // 1. 将套壳图塞回服务
-                [screenshot setBackingImage:shelledImage];
-                NSLog(@"[ScreenshotShell] :::::::::::::::::::: ✅ 已替换系统截图对象！");
-                
-                // 2. 独立保存到相册 (抢在系统前面)
-                saveShelledScreenshotToPhotos(shelledImage);
-                
-                // 3. 粉碎硬件缓存
-                SSEnvironmentDescription *envDesc = [screenshot environmentDescription];
-                if (envDesc) {
-                    if ([envDesc respondsToSelector:@selector(setImageSurface:)]) {
-                        [envDesc setImageSurface:nil];
-                        NSLog(@"[ScreenshotShell] :::::::::::::::::::: 💥 已粉碎 IOSurface！");
-                    }
-                    if ([envDesc respondsToSelector:@selector(setImagePixelSize:)]) {
-                        [envDesc setImagePixelSize:shelledImage.size];
-                    }
-                    if ([envDesc respondsToSelector:@selector(setImageScale:)]) {
-                        [envDesc setImageScale:1.0];
-                    }
+            SSEnvironmentDescription *envDesc = [self environmentDescription];
+            if (envDesc && [envDesc respondsToSelector:@selector(setImageSurface:)]) {
+                [envDesc setImageSurface:nil];
+            }
+            return;
+        }
+    }
+    %orig(image);
+}
+%end
+
+// 2. 接管底层相册写入 (利用系统的正常保存流，只存一张完美的 PNG！)
+%hook PHAssetCreationRequest
+
+- (void)addResourceWithType:(long long)type data:(NSData *)data options:(id)options {
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
+    if (type == 1 && data && prefs && [prefs[@"Enabled"] boolValue]) {
+        NSLog(@"[ScreenshotShell] :::::::::::::::::::: 📸 触发相册直写 (Data)");
+        UIImage *rawImage = [UIImage imageWithData:data];
+        if (rawImage) {
+            UIImage *shelled = applyShellToScreenshot(rawImage);
+            if (shelled && shelled != rawImage) {
+                // 强制输出为 PNG 以保留透明通道
+                NSData *shelledData = UIImagePNGRepresentation(shelled);
+                if (shelledData) {
+                    %orig(type, shelledData, options);
+                    return;
                 }
             }
-        } else {
-            NSLog(@"[ScreenshotShell] :::::::::::::::::::: ⚠️ 原图为空，可能还未生成 backingImage");
         }
-    } else {
-        NSLog(@"[ScreenshotShell] :::::::::::::::::::: ⚠️ 插件未开启或配置无效");
     }
-    
-    return screenshot;
+    %orig;
 }
 
-%end
-%end // SourceSniperHook
+- (void)addResourceWithType:(long long)type fileURL:(NSURL *)fileURL options:(id)options {
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
+    if (type == 1 && fileURL && prefs && [prefs[@"Enabled"] boolValue]) {
+        NSLog(@"[ScreenshotShell] :::::::::::::::::::: 📸 触发相册直写 (FileURL)");
+        UIImage *rawImage = [UIImage imageWithContentsOfFile:fileURL.path];
+        if (rawImage) {
+            UIImage *shelled = applyShellToScreenshot(rawImage);
+            if (shelled && shelled != rawImage) {
+                // 强制输出 PNG 保留透明通道
+                NSData *shelledData = UIImagePNGRepresentation(shelled);
+                if (shelledData) {
+                    // 经典的临时文件“狸猫换太子”，这个逻辑在你的机器上是绝对成功的
+                    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+                    tempPath = [tempPath stringByAppendingPathExtension:@"png"];
+                    [shelledData writeToFile:tempPath atomically:YES];
+                    
+                    NSURL *newURL = [NSURL fileURLWithPath:tempPath];
+                    %orig(type, newURL, options);
+                    return;
+                }
+            }
+        }
+    }
+    %orig;
+}
+
+%end // PHAssetCreationRequest
+
+%end // ScreenshotCoreHook
 
 // --------------------------------------------------------
 // 构造入口
 // --------------------------------------------------------
 %ctor {
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
-    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"]) {
+    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"] ||
+        [bundleId isEqualToString:@"com.apple.springboard"]) {
         NSLog(@"[ScreenshotShell] :::::::::::::::::::: 💉 成功注入进程: %@", bundleId);
-        %init(SourceSniperHook);
+        %init(ScreenshotCoreHook);
     }
 }
