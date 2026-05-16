@@ -13,12 +13,6 @@
 // ========================================================
 
 @class SSSScreenshotImageProvider;
-@class SSSScreenshotView;
-@class _SSSScreenshotImageView;
-
-@interface _SSSScreenshotImageView : UIView
-- (id)screenshot;
-@end
 
 @interface SSSScreenshot : NSObject
 - (void)setBackingImage:(UIImage *)image;
@@ -78,8 +72,6 @@ static BOOL isTweakEnabled(void) {
 // --------------------------------------------------------
 // 关联对象 key
 // --------------------------------------------------------
-static const void *kShellAppliedKey = &kShellAppliedKey;
-static const void *kShellBusyKey = &kShellBusyKey;
 static const void *kShellImageKey = &kShellImageKey;
 
 // --------------------------------------------------------
@@ -136,8 +128,6 @@ static BOOL RGBAAlmostEqual(const uint8_t a[4], const uint8_t b[4], int toleranc
 
 // --------------------------------------------------------
 // 判断图片是否已经是“壳图”
-// 逻辑：在壳图外框的几个固定点，检查当前图与 shell.png 是否几乎一致
-// 这样比“对象标记”稳得多，因为编辑/保存后 UIImage 往往会变成新实例
 // --------------------------------------------------------
 static BOOL ImageAlreadyContainsShell(UIImage *image, UIImage *shellImage, NSDictionary *cfg) {
     if (!image || !shellImage || !cfg) return NO;
@@ -156,7 +146,6 @@ static BOOL ImageAlreadyContainsShell(UIImage *image, UIImage *shellImage, NSDic
     CGSize imagePx = CGSizeMake(image.size.width * image.scale, image.size.height * image.scale);
     CGSize shellPx = CGSizeMake(shellImage.size.width * shellImage.scale, shellImage.size.height * shellImage.scale);
 
-    // 尺寸差太大，肯定不是同一代图
     if (fabs(imagePx.width - templateW) > 4.0 || fabs(imagePx.height - templateH) > 4.0) {
         return NO;
     }
@@ -164,7 +153,6 @@ static BOOL ImageAlreadyContainsShell(UIImage *image, UIImage *shellImage, NSDic
         return NO;
     }
 
-    // 取 4 个角和上边/下边几个点，只要这些点和 shell 一致，大概率已经套过壳
     CGPoint pts[] = {
         CGPointMake(3, 3),
         CGPointMake(templateW - 4, 3),
@@ -210,7 +198,7 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
     if (!shellImage) return rawScreenshot;
 
-    // 内容级防重入：如果它已经像壳图了，就直接返回
+    // 已经是壳图就直接返回原图
     if (ImageAlreadyContainsShell(rawScreenshot, shellImage, cfg)) {
         return rawScreenshot;
     }
@@ -252,35 +240,56 @@ static UIImage *ShellImageIfNeeded(UIImage *image) {
     return applyShellToScreenshot(image) ?: image;
 }
 
-static void ApplyShellToScreenshotObject(id screenshotObj) {
-    if (!screenshotObj || !isTweakEnabled()) return;
-    if (![screenshotObj respondsToSelector:@selector(backingImage)] ||
-        ![screenshotObj respondsToSelector:@selector(setBackingImage:)]) {
-        return;
+// 按“截图对象”缓存一次壳图，避免壳中壳
+static UIImage *ShellImageForScreenshot(SSSScreenshot *screenshot, UIImage *image) {
+    if (!image) return nil;
+
+    if (!isTweakEnabled()) {
+        return image;
     }
 
-    NSNumber *busy = objc_getAssociatedObject(screenshotObj, kShellBusyKey);
-    if (busy.boolValue) return;
-
-    objc_setAssociatedObject(screenshotObj, kShellBusyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    UIImage *image = [screenshotObj backingImage];
-    if ([image isKindOfClass:[UIImage class]]) {
-        UIImage *shell = ShellImageIfNeeded(image);
-        if (shell && shell != image) {
-            [screenshotObj setBackingImage:shell];
+    if (screenshot) {
+        UIImage *cached = objc_getAssociatedObject(screenshot, kShellImageKey);
+        if ([cached isKindOfClass:[UIImage class]]) {
+            return cached;
         }
     }
 
-    objc_setAssociatedObject(screenshotObj, kShellBusyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
+    NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
+    if (!cfgData) return image;
+
+    NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:0 error:nil];
+    if (![cfg isKindOfClass:[NSDictionary class]]) return image;
+
+    NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
+    UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
+    if (!shellImage) return image;
+
+    if (ImageAlreadyContainsShell(image, shellImage, cfg)) {
+        if (screenshot) {
+            objc_setAssociatedObject(screenshot, kShellImageKey, image, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        return image;
+    }
+
+    UIImage *rendered = applyShellToScreenshot(image);
+    if (!rendered) return image;
+
+    if (screenshot) {
+        objc_setAssociatedObject(screenshot, kShellImageKey, rendered, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    return rendered;
 }
 
-static id WrapImageBlock(id block) {
+static id WrapImageBlockForScreenshot(SSSScreenshot *screenshot, id block) {
     if (!block) return nil;
+
     void (^origBlock)(id) = [block copy];
     void (^wrappedBlock)(id) = ^(id image) {
         if ([image isKindOfClass:[UIImage class]]) {
-            origBlock(ShellImageIfNeeded((UIImage *)image));
+            origBlock(ShellImageForScreenshot(screenshot, (UIImage *)image));
         } else {
             origBlock(image);
         }
@@ -295,13 +304,31 @@ static id WrapImageBlock(id block) {
 
 %hook SSSScreenshot
 
-// 首图就直接套壳，避免只在编辑/保存时才生效
+// 首屏直接在截图对象上套壳，并缓存一次
 - (void)setBackingImage:(UIImage *)image {
-    if (isTweakEnabled() && [image isKindOfClass:[UIImage class]]) {
-        %orig(ShellImageIfNeeded(image));
+    objc_setAssociatedObject(self, kShellImageKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    if (!isTweakEnabled() || ![image isKindOfClass:[UIImage class]]) {
+        %orig(image);
         return;
     }
-    %orig(image);
+
+    UIImage *shell = ShellImageForScreenshot(self, image);
+    %orig(shell ?: image);
+}
+
+- (UIImage *)backingImage {
+    UIImage *image = %orig;
+    if (!isTweakEnabled() || ![image isKindOfClass:[UIImage class]]) {
+        return image;
+    }
+
+    UIImage *cached = objc_getAssociatedObject(self, kShellImageKey);
+    if ([cached isKindOfClass:[UIImage class]]) {
+        return cached;
+    }
+
+    return ShellImageForScreenshot(self, image);
 }
 
 - (void)requestImageInTransition:(_Bool)transition withBlock:(id)block {
@@ -310,69 +337,8 @@ static id WrapImageBlock(id block) {
         return;
     }
 
-    id wrapped = WrapImageBlock(block);
+    id wrapped = WrapImageBlockForScreenshot(self, block);
     %orig(transition, wrapped);
-}
-
-%end
-
-%hook SSSScreenshotView
-
-- (void)setScreenshot:(id)screenshot {
-    if (isTweakEnabled()) {
-        ApplyShellToScreenshotObject(screenshot);
-    }
-    %orig(screenshot);
-}
-
-%end
-
-%hook _SSSScreenshotImageView
-
-- (void)setScreenshot:(id)screenshot {
-    if (isTweakEnabled()) {
-        ApplyShellToScreenshotObject(screenshot);
-    }
-    %orig(screenshot);
-}
-
-- (void)imageViewDidLoadImage:(id)image {
-    if (isTweakEnabled() && [image isKindOfClass:[UIImage class]]) {
-        id screenshot = nil;
-        if ([self respondsToSelector:@selector(screenshot)]) {
-            screenshot = [self screenshot];
-        }
-        if (screenshot) {
-            ApplyShellToScreenshotObject(screenshot);
-        }
-    }
-    %orig(image);
-}
-
-- (void)_paperKitImageView:(id)view didFinishUpdatingImage:(id)image {
-    if (isTweakEnabled() && [image isKindOfClass:[UIImage class]]) {
-        id screenshot = nil;
-        if ([self respondsToSelector:@selector(screenshot)]) {
-            screenshot = [self screenshot];
-        }
-        if (screenshot) {
-            ApplyShellToScreenshotObject(screenshot);
-        }
-    }
-    %orig(view, image);
-}
-
-- (void)_paperKitImageView:(id)view willBeginUpdatingImage:(id)image {
-    if (isTweakEnabled() && [image isKindOfClass:[UIImage class]]) {
-        id screenshot = nil;
-        if ([self respondsToSelector:@selector(screenshot)]) {
-            screenshot = [self screenshot];
-        }
-        if (screenshot) {
-            ApplyShellToScreenshotObject(screenshot);
-        }
-    }
-    %orig(view, image);
 }
 
 %end
@@ -383,14 +349,18 @@ static id WrapImageBlock(id block) {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShellImageIfNeeded((UIImage *)image);
+
+    SSSScreenshot *shot = [self screenshot];
+    return ShellImageForScreenshot(shot, (UIImage *)image);
 }
 
 - (id)requestUneditedImageForUIBlocking {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShellImageIfNeeded((UIImage *)image);
+
+    SSSScreenshot *shot = [self screenshot];
+    return ShellImageForScreenshot(shot, (UIImage *)image);
 }
 
 - (void)requestCGImageBackedUneditedImageForUI:(id)ui {
@@ -398,7 +368,8 @@ static id WrapImageBlock(id block) {
         %orig(ui);
         return;
     }
-    %orig(WrapImageBlock(ui));
+    SSSScreenshot *shot = [self screenshot];
+    %orig(WrapImageBlockForScreenshot(shot, ui));
 }
 
 - (void)requestUneditedImageForUI:(id)ui {
@@ -406,21 +377,26 @@ static id WrapImageBlock(id block) {
         %orig(ui);
         return;
     }
-    %orig(WrapImageBlock(ui));
+    SSSScreenshot *shot = [self screenshot];
+    %orig(WrapImageBlockForScreenshot(shot, ui));
 }
 
 - (id)requestOutputImageForUIBlocking {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShellImageIfNeeded((UIImage *)image);
+
+    SSSScreenshot *shot = [self screenshot];
+    return ShellImageForScreenshot(shot, (UIImage *)image);
 }
 
 - (id)requestOutputImageForSavingBlocking {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShellImageIfNeeded((UIImage *)image);
+
+    SSSScreenshot *shot = [self screenshot];
+    return ShellImageForScreenshot(shot, (UIImage *)image);
 }
 
 - (void)requestOutputImageForUI:(id)block {
@@ -428,7 +404,8 @@ static id WrapImageBlock(id block) {
         %orig(block);
         return;
     }
-    %orig(WrapImageBlock(block));
+    SSSScreenshot *shot = [self screenshot];
+    %orig(WrapImageBlockForScreenshot(shot, block));
 }
 
 - (void)requestOutputImageForSaving:(id)block {
@@ -436,7 +413,8 @@ static id WrapImageBlock(id block) {
         %orig(block);
         return;
     }
-    %orig(WrapImageBlock(block));
+    SSSScreenshot *shot = [self screenshot];
+    %orig(WrapImageBlockForScreenshot(shot, block));
 }
 
 - (void)requestOutputImageInTransition:(_Bool)transition forSaving:(id)block {
@@ -444,7 +422,8 @@ static id WrapImageBlock(id block) {
         %orig(transition, block);
         return;
     }
-    %orig(transition, WrapImageBlock(block));
+    SSSScreenshot *shot = [self screenshot];
+    %orig(transition, WrapImageBlockForScreenshot(shot, block));
 }
 
 %end
