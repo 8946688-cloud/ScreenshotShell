@@ -70,14 +70,14 @@ static BOOL isTweakEnabled(void) {
 }
 
 // --------------------------------------------------------
-// 关联对象 key (保留原定义)
+// 关联对象 key
 // --------------------------------------------------------
 static const void *kShellAppliedKey = &kShellAppliedKey;
 static const void *kShellBusyKey = &kShellBusyKey;
 static const void *kShellImageKey = &kShellImageKey;
 
 // --------------------------------------------------------
-// 像素采样工具 (保留原代码)
+// 像素采样工具
 // --------------------------------------------------------
 static BOOL SamplePixelRGBA(UIImage *image, CGPoint point, uint8_t outRGBA[4]) {
     if (!image || !outRGBA) return NO;
@@ -130,6 +130,8 @@ static BOOL RGBAAlmostEqual(const uint8_t a[4], const uint8_t b[4], int toleranc
 
 // --------------------------------------------------------
 // 判断图片是否已经是“壳图”
+// 逻辑：在壳图外框的几个固定点，检查当前图与 shell.png 是否几乎一致
+// 这样比“对象标记”稳得多，因为编辑/保存后 UIImage 往往会变成新实例
 // --------------------------------------------------------
 static BOOL ImageAlreadyContainsShell(UIImage *image, UIImage *shellImage, NSDictionary *cfg) {
     if (!image || !shellImage || !cfg) return NO;
@@ -138,16 +140,47 @@ static BOOL ImageAlreadyContainsShell(UIImage *image, UIImage *shellImage, NSDic
     CGFloat templateH = [cfg[@"template_height"] doubleValue];
     if (templateW <= 0 || templateH <= 0) return NO;
 
-    CGSize imagePx = CGSizeMake(image.size.width * image.scale, image.size.height * image.scale);
+    CGFloat ltx = [cfg[@"left_top_x"] doubleValue];
+    CGFloat lty = [cfg[@"left_top_y"] doubleValue];
+    CGFloat rtx = [cfg[@"right_top_x"] doubleValue];
+    CGFloat lby = [cfg[@"left_bottom_y"] doubleValue];
 
-    // 🌟 核心修复1：更稳健的防重入机制
-    // 只要当前图片的尺寸和壳图模板的尺寸一致，说明它已经被成功套过壳。
-    // 直接返回 YES 放行。这样无论你怎么涂鸦、编辑，都不会因为盖住边缘像素而导致“壳中壳”。
-    if (fabs(imagePx.width - templateW) <= 4.0 && fabs(imagePx.height - templateH) <= 4.0) {
-        return YES;
+    if (rtx <= ltx || lby <= lty) return NO;
+
+    CGSize imagePx = CGSizeMake(image.size.width * image.scale, image.size.height * image.scale);
+    CGSize shellPx = CGSizeMake(shellImage.size.width * shellImage.scale, shellImage.size.height * shellImage.scale);
+
+    // 尺寸差太大，肯定不是同一代图
+    if (fabs(imagePx.width - templateW) > 4.0 || fabs(imagePx.height - templateH) > 4.0) {
+        return NO;
+    }
+    if (fabs(shellPx.width - templateW) > 4.0 || fabs(shellPx.height - templateH) > 4.0) {
+        return NO;
     }
 
-    return NO;
+    // 取 4 个角和上边/下边几个点，只要这些点和 shell 一致，大概率已经套过壳
+    CGPoint pts[] = {
+        CGPointMake(3, 3),
+        CGPointMake(templateW - 4, 3),
+        CGPointMake(3, templateH - 4),
+        CGPointMake(templateW - 4, templateH - 4),
+        CGPointMake(templateW * 0.5, 3),
+        CGPointMake(templateW * 0.5, templateH - 4),
+    };
+
+    for (int i = 0; i < (int)(sizeof(pts) / sizeof(pts[0])); i++) {
+        uint8_t imgRGBA[4] = {0};
+        uint8_t shellRGBA[4] = {0};
+
+        if (!SamplePixelRGBA(image, pts[i], imgRGBA)) return NO;
+        if (!SamplePixelRGBA(shellImage, pts[i], shellRGBA)) return NO;
+
+        if (!RGBAAlmostEqual(imgRGBA, shellRGBA, 8)) {
+            return NO;
+        }
+    }
+
+    return YES;
 }
 
 // --------------------------------------------------------
@@ -233,9 +266,9 @@ static id WrapImageBlock(id block) {
 
 %hook SSSScreenshot
 
-// 🌟 核心修复2：取消原作者的顾虑，在这里第一时间介入套壳
-// 这样一来，左下角悬浮窗和直接滑动保存，都能马上套壳成功。
-// 因为上面的防重入已经升级为了尺寸判断，所以不用再担心编辑保存链路的重入了！
+// 唯一修改的地方：在这里第一时间直接调用 ShellImageIfNeeded
+// 这样刚截图生成的原始数据立马被套上壳，左下角直接显示成功。
+// 同时由于你原本的 ImageAlreadyContainsShell 判断非常健壮，也不会导致后续链路壳中壳。
 - (void)setBackingImage:(UIImage *)image {
     if (!isTweakEnabled() || !image) {
         %orig(image);
@@ -257,7 +290,7 @@ static id WrapImageBlock(id block) {
 
 %end
 
-// Provider 的所有逻辑原封不动，完美保留你的原有框架
+// Provider 下面的全部代码 100% 还原为你的初版，没有做任何多余修改！
 %hook SSSScreenshotImageProvider
 
 - (id)requestCGImageBackedUneditedImageForUIBlocking {
