@@ -1,33 +1,11 @@
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
-#import <objc/runtime.h>
 
 #if __has_include(<roothide.h>)
 #import <roothide.h>
 #else
 #define jbroot(path) path
 #endif
-
-// --------------------------------------------------------
-// 私有头文件声明
-// --------------------------------------------------------
-@interface SSEnvironmentDescription : NSObject
-- (void)setImageSurface:(id)surface;
-@end
-
-@interface SSSScreenshot : NSObject
-@property (retain, nonatomic) UIImage *backingImage;
-@property (readonly, nonatomic) SSEnvironmentDescription *environmentDescription;
-- (void)requestImageInTransition:(BOOL)transition withBlock:(id)block;
-@end
-
-@interface SSSScreenshotImageProvider : NSObject
-@property (nonatomic, weak) SSSScreenshot *screenshot;
-- (id)requestOutputImageForSavingBlocking;
-- (id)requestOutputImageForUIBlocking;
-- (void)requestOutputImageForSaving:(id)block;
-- (void)requestOutputImageForUI:(id)block;
-@end
 
 // --------------------------------------------------------
 // 路径与配置
@@ -61,30 +39,50 @@ static BOOL isTweakEnabled(void) {
     return prefs ? [prefs[@"Enabled"] boolValue] : NO;
 }
 
-// 防重复套壳标记 (用于常规拦截)
-static const void *kShellAppliedKey = &kShellAppliedKey;
-
-static BOOL ImageAlreadyShelled(UIImage *image) {
+// --------------------------------------------------------
+// 终极杀招：防套娃（壳中壳）物理检验
+// --------------------------------------------------------
+static BOOL IsImageAlreadyShelled(UIImage *image, CGFloat templateW, CGFloat templateH) {
     if (!image) return NO;
-    NSNumber *flag = objc_getAssociatedObject(image, kShellAppliedKey);
-    return [flag boolValue];
-}
 
-static UIImage *MarkImageShelled(UIImage *image) {
-    if (image) {
-        objc_setAssociatedObject(image, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // 1. 【第一道防线】：尺寸校验
+    // 如果图片的实际像素宽高已经等于壳子的宽高，说明肯定套过壳了
+    CGFloat pixelW = image.size.width * image.scale;
+    CGFloat pixelH = image.size.height * image.scale;
+    if (fabs(pixelW - templateW) < 2.0 && fabs(pixelH - templateH) < 2.0) {
+        return YES;
     }
-    return image;
+
+    // 2. 【第二道防线】：读取左上角 (0,0) 的暗号像素
+    CGImageRef cgImage = image.CGImage;
+    if (!cgImage) return NO;
+
+    CGImageRef subImage = CGImageCreateWithImageInRect(cgImage, CGRectMake(0, 0, 1, 1));
+    if (!subImage) return NO;
+
+    unsigned char pixel[4] = {0};
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(pixel, 1, 1, 8, 4, colorSpace, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    if (context) {
+        CGContextDrawImage(context, CGRectMake(0, 0, 1, 1), subImage);
+        CGContextRelease(context);
+    }
+    CGColorSpaceRelease(colorSpace);
+    CGImageRelease(subImage);
+
+    // 对暗号：我们在套壳时写入了特殊的颜色 R:12, G:34, B:56
+    if (abs(pixel[0] - 12) <= 2 && abs(pixel[1] - 34) <= 2 && abs(pixel[2] - 56) <= 2) {
+        return YES;
+    }
+
+    return NO;
 }
 
 // --------------------------------------------------------
-// 核心：精准合成图像 + 终极特征防套娃
+// 核心：精准合成图像
 // --------------------------------------------------------
 static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
-    
-    // 软拦截：检查关联对象
-    if (ImageAlreadyShelled(rawScreenshot)) return rawScreenshot;
 
     NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
     NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
@@ -97,12 +95,8 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     CGFloat templateH = [cfg[@"template_height"] doubleValue];
     if (templateW <= 0 || templateH <= 0) return rawScreenshot;
 
-    // ==========================================
-    // 终极杀招：物理特征防套娃 (彻底解决相册底层的壳中壳)
-    // 苹果原生的截图 scale 是 2.0 或 3.0，而我们合成的图强制为 1.0。
-    // 如果一张图的 scale 已经是 1.0，并且宽度等于模板宽度，说明100%是我们的图！
-    // ==========================================
-    if (rawScreenshot.scale == 1.0 && fabs(rawScreenshot.size.width - templateW) < 1.0 && fabs(rawScreenshot.size.height - templateH) < 1.0) {
+    // 【防套娃检测】如果在任何流转环节发现图已经套好壳，直接返回原指针！
+    if (IsImageAlreadyShelled(rawScreenshot, templateW, templateH)) {
         return rawScreenshot;
     }
 
@@ -121,7 +115,7 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 
     CGSize outSize = CGSizeMake(templateW, templateH);
 
-    // 强制使用比例 1.0 进行渲染，彻底摆脱屏幕比例的干扰
+    // 强制按 1.0 比例画图，绝对不改变 config 定义的物理像素！
     UIGraphicsBeginImageContextWithOptions(outSize, NO, 1.0);
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (ctx) {
@@ -130,72 +124,28 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 
     // 1. 原图填洞
     [rawScreenshot drawInRect:CGRectMake(ltx, lty, holeW, holeH)];
+    
     // 2. 盖上外壳
     [shellImage drawInRect:CGRectMake(0, 0, outSize.width, outSize.height)];
+
+    // 3. 【打下防伪暗号】在左上角坐标 (0,0) 画一个肉眼不可见的颜色像素！
+    CGContextSetRGBFillColor(ctx, 12.0/255.0, 34.0/255.0, 56.0/255.0, 1.0);
+    CGContextFillRect(ctx, CGRectMake(0, 0, 1, 1));
 
     UIImage *rendered = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
 
     if (!rendered) return rawScreenshot;
 
-    // 强制按 1.0 比例导出，尺寸永远是固定的 templateW/templateH
-    UIImage *finalImage = [UIImage imageWithCGImage:rendered.CGImage
-                                              scale:1.0
-                                        orientation:UIImageOrientationUp];
-    return MarkImageShelled(finalImage);
+    return [UIImage imageWithCGImage:rendered.CGImage scale:1.0 orientation:UIImageOrientationUp];
 }
-
 
 // --------------------------------------------------------
 // Hook 注入
 // --------------------------------------------------------
 %group ScreenshotCoreHook
 
-// --- 解决小窗口显示原图的问题 ---
-%hook SSSScreenshot
-
-// 拦截小窗口过渡动画，确保出现瞬间就是带壳的
-- (void)requestImageInTransition:(BOOL)transition withBlock:(id)block {
-    if (!block || !isTweakEnabled()) {
-        %orig(transition, block);
-        return;
-    }
-    void (^origBlock)(id) = [block copy];
-    void (^wrappedBlock)(id) = ^(id image) {
-        if ([image isKindOfClass:[UIImage class]]) {
-            UIImage *shelled = applyShellToScreenshot((UIImage *)image);
-            origBlock(shelled ?: image);
-        } else {
-            origBlock(image);
-        }
-    };
-    %orig(transition, wrappedBlock);
-}
-
-// 同步替换底层原图
-- (void)setBackingImage:(UIImage *)image {
-    if (image && isTweakEnabled()) {
-        UIImage *shelled = applyShellToScreenshot(image);
-        if (shelled) {
-            %orig(shelled);
-            return;
-        }
-    }
-    %orig(image);
-}
-
-- (UIImage *)backingImage {
-    UIImage *orig = %orig;
-    if (orig && isTweakEnabled()) {
-        return applyShellToScreenshot(orig) ?: orig;
-    }
-    return orig;
-}
-
-%end
-
-
-// --- 解决编辑界面的数据提供器 ---
+// --- 提供给 UI 小窗口和编辑器使用的通道 ---
 %hook SSSScreenshotImageProvider
 
 - (id)requestOutputImageForUIBlocking {
@@ -249,14 +199,14 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 }
 %end
 
-
-// --- 解决不编辑就无法保存的问题 (你完美的相册兜底方案) ---
+// --- 提供给相册最终保存的兜底通道 (完美解决“不编辑无法保存”的问题) ---
 %hook PHAssetCreationRequest
 
 + (instancetype)creationRequestForAssetFromImage:(UIImage *)image {
     if (image && isTweakEnabled()) {
         UIImage *shelled = applyShellToScreenshot(image);
-        if (shelled) {
+        // 如果指针没变，说明是触发了“防套娃鉴权”（即已经套过了），原路放行即可！
+        if (shelled && shelled != image) {
             return %orig(shelled);
         }
     }
@@ -270,7 +220,7 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
             UIImage *rawImage = [UIImage imageWithData:data];
             if (rawImage) {
                 UIImage *shelled = applyShellToScreenshot(rawImage);
-                if (shelled) {
+                if (shelled && shelled != rawImage) {
                     NSData *png = UIImagePNGRepresentation(shelled);
                     if (png) {
                         NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
@@ -291,7 +241,7 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
         UIImage *rawImage = [UIImage imageWithData:data];
         if (rawImage) {
             UIImage *shelled = applyShellToScreenshot(rawImage);
-            if (shelled) {
+            if (shelled && shelled != rawImage) {
                 NSData *png = UIImagePNGRepresentation(shelled);
                 if (png) {
                     %orig(type, png, options);
@@ -310,7 +260,7 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
             UIImage *rawImage = [UIImage imageWithData:data];
             if (rawImage) {
                 UIImage *shelled = applyShellToScreenshot(rawImage);
-                if (shelled) {
+                if (shelled && shelled != rawImage) {
                     NSData *png = UIImagePNGRepresentation(shelled);
                     if (png) {
                         NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
@@ -326,7 +276,6 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     }
     %orig(type, fileURL, options);
 }
-
 %end
 
 %hook PHAssetChangeRequest
@@ -334,7 +283,7 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 + (instancetype)creationRequestForAssetFromImage:(UIImage *)image {
     if (image && isTweakEnabled()) {
         UIImage *shelled = applyShellToScreenshot(image);
-        if (shelled) {
+        if (shelled && shelled != image) {
             return %orig(shelled);
         }
     }
@@ -348,7 +297,7 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
             UIImage *rawImage = [UIImage imageWithData:data];
             if (rawImage) {
                 UIImage *shelled = applyShellToScreenshot(rawImage);
-                if (shelled) {
+                if (shelled && shelled != rawImage) {
                     NSData *png = UIImagePNGRepresentation(shelled);
                     if (png) {
                         NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
