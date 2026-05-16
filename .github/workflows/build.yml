@@ -1,23 +1,14 @@
 name: Build ScreenshotShell
 
-# 触发条件：当你推送到 main/master 分支，或者手动点击运行按钮时触发
 on:
-  push:
-    branches:
-      - main
-      - master
-  pull_request:
-    branches:
-      - main
-      - master
   workflow_dispatch:
 
 jobs:
   build:
     name: Build iOS Tweak
-    runs-on: macos-latest 
+    runs-on: macos-latest
     env:
-      THEOS: ${{ github.workspace }}/theos 
+      THEOS: ${{ github.workspace }}/theos
 
     steps:
       - name: 📥 检出代码 (Checkout Repository)
@@ -30,7 +21,6 @@ jobs:
       - name: 🛠️ 配置 Theos 环境 (Setup Roothide Theos)
         run: |
           echo "Cloning Roothide Theos fork..."
-          # 【核心优化】：直接使用 Roothide 官方分支的 Theos，自带头文件且完美支持三种环境！
           git clone --recursive https://github.com/roothide/theos.git $THEOS
 
       - name: 📦 下载 iOS SDK (Setup iOS SDKs)
@@ -45,12 +35,12 @@ jobs:
           echo ">>> 正在编译 Rootful (有根) 版本..."
           make clean
           make package FINALPACKAGE=1
-          
+
           # 2. 编译 Rootless (无根)
           echo ">>> 正在编译 Rootless (无根) 版本..."
           make clean
           make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-          
+
           # 3. 编译 Roothide (隐根)
           echo ">>> 正在编译 Roothide (隐根) 版本..."
           make clean
