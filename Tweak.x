@@ -271,12 +271,29 @@ static id WrapImageBlock(id block) {
         %orig(image);
         return;
     }
+    
+    // 检查此截图对象是否已经成功套壳，防止重复处理
+    BOOL alreadyShelled = [objc_getAssociatedObject(self, kShellAppliedKey) boolValue];
+    if (alreadyShelled) {
+        %orig(image);
+        return;
+    }
+
+    // 核心修改：在这里马上套壳，使得左下角缩略图能够立刻生效
     UIImage *shelledImage = ShellImageIfNeeded(image);
-    %orig(shelledImage);
+    
+    // 如果套壳成功，在当前截图对象上打上标记
+    if (shelledImage) {
+        objc_setAssociatedObject(self, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    
+    %orig(shelledImage ?: image);
 }
 
 - (void)requestImageInTransition:(_Bool)transition withBlock:(id)block {
-    if (!block || !isTweakEnabled()) {
+    BOOL alreadyShelled = [objc_getAssociatedObject(self, kShellAppliedKey) boolValue];
+    
+    if (!block || !isTweakEnabled() || alreadyShelled) {
         %orig(transition, block);
         return;
     }
@@ -290,6 +307,12 @@ static id WrapImageBlock(id block) {
 %hook SSSScreenshotImageProvider
 
 - (id)requestCGImageBackedUneditedImageForUIBlocking {
+    SSSScreenshot *ss = [self screenshot];
+    // 核心拦截：如果原图已经被 setBackingImage 套壳，直接返回即可，避免引发壳中壳
+    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) {
+        return %orig;
+    }
+    
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
@@ -297,6 +320,11 @@ static id WrapImageBlock(id block) {
 }
 
 - (id)requestUneditedImageForUIBlocking {
+    SSSScreenshot *ss = [self screenshot];
+    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) {
+        return %orig;
+    }
+    
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
@@ -304,7 +332,8 @@ static id WrapImageBlock(id block) {
 }
 
 - (void)requestCGImageBackedUneditedImageForUI:(id)ui {
-    if (!ui || !isTweakEnabled()) {
+    SSSScreenshot *ss = [self screenshot];
+    if (!ui || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
         %orig(ui);
         return;
     }
@@ -312,7 +341,8 @@ static id WrapImageBlock(id block) {
 }
 
 - (void)requestUneditedImageForUI:(id)ui {
-    if (!ui || !isTweakEnabled()) {
+    SSSScreenshot *ss = [self screenshot];
+    if (!ui || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
         %orig(ui);
         return;
     }
@@ -320,6 +350,11 @@ static id WrapImageBlock(id block) {
 }
 
 - (id)requestOutputImageForUIBlocking {
+    SSSScreenshot *ss = [self screenshot];
+    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) {
+        return %orig;
+    }
+    
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
@@ -327,6 +362,11 @@ static id WrapImageBlock(id block) {
 }
 
 - (id)requestOutputImageForSavingBlocking {
+    SSSScreenshot *ss = [self screenshot];
+    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) {
+        return %orig;
+    }
+    
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
@@ -334,7 +374,8 @@ static id WrapImageBlock(id block) {
 }
 
 - (void)requestOutputImageForUI:(id)block {
-    if (!block || !isTweakEnabled()) {
+    SSSScreenshot *ss = [self screenshot];
+    if (!block || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
         %orig(block);
         return;
     }
@@ -342,7 +383,8 @@ static id WrapImageBlock(id block) {
 }
 
 - (void)requestOutputImageForSaving:(id)block {
-    if (!block || !isTweakEnabled()) {
+    SSSScreenshot *ss = [self screenshot];
+    if (!block || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
         %orig(block);
         return;
     }
@@ -350,7 +392,8 @@ static id WrapImageBlock(id block) {
 }
 
 - (void)requestOutputImageInTransition:(_Bool)transition forSaving:(id)block {
-    if (!block || !isTweakEnabled()) {
+    SSSScreenshot *ss = [self screenshot];
+    if (!block || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
         %orig(transition, block);
         return;
     }
