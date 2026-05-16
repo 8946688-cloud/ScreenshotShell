@@ -72,7 +72,7 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
         
         // 1. 获取原截图真实的物理像素尺寸
         CGFloat rawW = rawScreenshot.size.width * rawScreenshot.scale;
-        CGFloat rawH = rawScreenshot.size.height * rawScreenshot.scale;
+       // CGFloat rawH = rawScreenshot.size.height * rawScreenshot.scale;
         
         CGFloat templateW = [cfg[@"template_width"] floatValue];
         CGFloat templateH = [cfg[@"template_height"] floatValue];
