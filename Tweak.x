@@ -231,18 +231,21 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
 %end // PhotoSaveHook
 
 // --------------------------------------------------------
-// 构造入口
+// 构造入口 (修复 Logos 编译器的 reinit 报错)
 // --------------------------------------------------------
 %ctor {
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
     
-    // 悬浮窗服务（处理 UI）
-    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"]) {
-        %init(ScreenshotUIHook);
+    // 合并判断：只要是这两个进程之一，就加载相册保存拦截钩子
+    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"] ||
+        [bundleId isEqualToString:@"com.apple.springboard"]) {
+        
+        // 整个文件中只写一次，完美绕过 Theos 的重复编译检查！
         %init(PhotoSaveHook);
-    } 
-    // SpringBoard 或其他进程如果直接调用了底层相册保存 API，一并拦截！
-    else if ([bundleId isEqualToString:@"com.apple.springboard"]) {
-        %init(PhotoSaveHook);
+        
+        // 只有悬浮窗服务进程，才额外加载悬浮窗 UI 处理钩子
+        if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"]) {
+            %init(ScreenshotUIHook);
+        }
     }
 }
