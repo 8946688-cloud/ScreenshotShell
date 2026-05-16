@@ -8,6 +8,33 @@
 #define jbroot(path) path
 #endif
 
+// ========================================================
+// Minimal private class declarations
+// ========================================================
+
+@class SSSScreenshotImageProvider;
+
+@interface SSSScreenshot : NSObject
+- (void)setBackingImage:(UIImage *)image;
+- (UIImage *)backingImage;
+- (SSSScreenshotImageProvider *)imageProvider;
+- (void)requestImageInTransition:(_Bool)transition withBlock:(id /* block */)block;
+@end
+
+@interface SSSScreenshotImageProvider : NSObject
+- (SSSScreenshot *)screenshot;
+- (void)setScreenshot:(SSSScreenshot *)screenshot;
+- (id)requestCGImageBackedUneditedImageForUIBlocking;
+- (id)requestUneditedImageForUIBlocking;
+- (void)requestCGImageBackedUneditedImageForUI:(id /* block */)ui;
+- (void)requestUneditedImageForUI:(id /* block */)ui;
+- (id)requestOutputImageForUIBlocking;
+- (id)requestOutputImageForSavingBlocking;
+- (void)requestOutputImageForUI:(id /* block */)block;
+- (void)requestOutputImageForSaving:(id /* block */)block;
+- (void)requestOutputImageInTransition:(_Bool)transition forSaving:(id /* block */)block;
+@end
+
 // --------------------------------------------------------
 // 路径与配置
 // --------------------------------------------------------
@@ -41,36 +68,54 @@ static BOOL isTweakEnabled(void) {
 }
 
 // --------------------------------------------------------
-// 截图生命周期标记：只允许整条链路套壳一次
+// 生命周期级防重复标记
 // --------------------------------------------------------
 static const void *kShellAppliedKey = &kShellAppliedKey;
+static const void *kShellImageKey = &kShellImageKey;
 static const void *kShellBusyKey = &kShellBusyKey;
 
-static BOOL ScreenshotShellApplied(id screenshot) {
-    if (!screenshot) return NO;
-    return [objc_getAssociatedObject(screenshot, kShellAppliedKey) boolValue];
+static BOOL HostShellApplied(id host) {
+    if (!host) return NO;
+    return [objc_getAssociatedObject(host, kShellAppliedKey) boolValue];
 }
 
-static void SetScreenshotShellApplied(id screenshot, BOOL applied) {
-    if (!screenshot) return;
-    objc_setAssociatedObject(screenshot, kShellAppliedKey, @(applied), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+static void SetHostShellApplied(id host, BOOL applied) {
+    if (!host) return;
+    objc_setAssociatedObject(host, kShellAppliedKey, @(applied), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static BOOL ScreenshotShellBusy(id screenshot) {
-    if (!screenshot) return NO;
-    return [objc_getAssociatedObject(screenshot, kShellBusyKey) boolValue];
+static BOOL HostShellBusy(id host) {
+    if (!host) return NO;
+    return [objc_getAssociatedObject(host, kShellBusyKey) boolValue];
 }
 
-static void SetScreenshotShellBusy(id screenshot, BOOL busy) {
-    if (!screenshot) return;
-    objc_setAssociatedObject(screenshot, kShellBusyKey, @(busy), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+static void SetHostShellBusy(id host, BOOL busy) {
+    if (!host) return;
+    objc_setAssociatedObject(host, kShellBusyKey, @(busy), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static UIImage *HostShelledImage(id host) {
+    if (!host) return nil;
+    id obj = objc_getAssociatedObject(host, kShellImageKey);
+    return [obj isKindOfClass:[UIImage class]] ? (UIImage *)obj : nil;
+}
+
+static void SetHostShelledImage(id host, UIImage *image) {
+    if (!host || !image) return;
+    objc_setAssociatedObject(host, kShellImageKey, image, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(host, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 // --------------------------------------------------------
-// 核心：合成图片
+// 核心：图像合成
 // --------------------------------------------------------
 static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
+
+    // 如果这个 UIImage 自己已经被标记过，直接返回，避免同一对象重复处理
+    if ([objc_getAssociatedObject(rawScreenshot, kShellAppliedKey) boolValue]) {
+        return rawScreenshot;
+    }
 
     NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
     NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
@@ -115,135 +160,55 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     UIImage *finalImage = [UIImage imageWithCGImage:rendered.CGImage
                                               scale:1.0
                                         orientation:UIImageOrientationUp];
-    return finalImage ?: rendered ?: rawScreenshot;
-}
-
-// --------------------------------------------------------
-// 缓存与复用
-// --------------------------------------------------------
-static UIImage *GetProviderCachedShelledImage(id provider) {
-    if (!provider) return nil;
-
-    UIImage *cached = nil;
-    @try {
-        if ([provider respondsToSelector:@selector(cachedOutputImage)]) {
-            cached = [provider cachedOutputImage];
-            if (cached) return cached;
-        }
-        if ([provider respondsToSelector:@selector(cachedCGImageBackedUneditedImageForUI)]) {
-            cached = [provider cachedCGImageBackedUneditedImageForUI];
-            if (cached) return cached;
-        }
-    } @catch (__unused NSException *e) {
+    if (finalImage) {
+        objc_setAssociatedObject(finalImage, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return finalImage;
     }
-    return nil;
+
+    return rendered ?: rawScreenshot;
 }
 
-static void SetProviderShelledCache(id provider, UIImage *image) {
-    if (!provider || !image) return;
-
-    @try {
-        if ([provider respondsToSelector:@selector(setCachedCGImageBackedUneditedImageForUI:)]) {
-            [provider setCachedCGImageBackedUneditedImageForUI:image];
-        }
-        if ([provider respondsToSelector:@selector(setCachedOutputImage:)]) {
-            [provider setCachedOutputImage:image];
-        }
-        if ([provider respondsToSelector:@selector(setHasOriginalUneditedImage:)]) {
-            [provider setHasOriginalUneditedImage:YES];
-        }
-        if ([provider respondsToSelector:@selector(setHasChangedBackingImage:)]) {
-            [provider setHasChangedBackingImage:NO];
-        }
-    } @catch (__unused NSException *e) {
-    }
+static UIImage *ShellImageIfNeeded(UIImage *image) {
+    if (!image) return nil;
+    return applyShellToScreenshot(image) ?: image;
 }
 
-static UIImage *ShelledImageForScreenshot(id screenshot, id provider, UIImage *image) {
+static UIImage *ShellImageForHost(id host, UIImage *image) {
     if (!image) return nil;
     if (!isTweakEnabled()) return image;
 
-    // 已经在这张截图生命周期里套过壳，直接复用缓存，不再重画
-    if (ScreenshotShellApplied(screenshot)) {
-        UIImage *cached = GetProviderCachedShelledImage(provider);
+    // 已经套过壳：优先复用 host 缓存
+    if (HostShellApplied(host)) {
+        UIImage *cached = HostShelledImage(host);
         if (cached) return cached;
+    }
 
-        @try {
-            if (screenshot && [screenshot respondsToSelector:@selector(backingImage)]) {
-                UIImage *backing = [screenshot backingImage];
-                if (backing) return backing;
-            }
-        } @catch (__unused NSException *e) {
-        }
-
+    // 防重入
+    if (HostShellBusy(host)) {
         return image;
     }
 
-    // 防止同一个调用链里重入
-    if (ScreenshotShellBusy(screenshot)) {
-        return image;
-    }
+    SetHostShellBusy(host, YES);
 
-    SetScreenshotShellBusy(screenshot, YES);
-
-    UIImage *shelled = applyShellToScreenshot(image);
+    UIImage *shelled = ShellImageIfNeeded(image);
     if (shelled) {
-        SetScreenshotShellApplied(screenshot, YES);
-        if (provider) {
-            SetProviderShelledCache(provider, shelled);
-        }
-
-        // 关键：把最终结果写回截图对象本身，后续 UI / 保存都复用它
-        @try {
-            if (screenshot && [screenshot respondsToSelector:@selector(setBackingImage:)]) {
-                [screenshot setBackingImage:shelled];
-            }
-        } @catch (__unused NSException *e) {
-        }
+        SetHostShelledImage(host, shelled);
     }
 
-    SetScreenshotShellBusy(screenshot, NO);
+    SetHostShellBusy(host, NO);
     return shelled ?: image;
 }
 
-static UIImage *ShelledImageFromProvider(id provider, UIImage *image) {
-    id screenshot = nil;
-    @try {
-        if ([provider respondsToSelector:@selector(screenshot)]) {
-            screenshot = [provider screenshot];
-        }
-    } @catch (__unused NSException *e) {
-    }
-    return ShelledImageForScreenshot(screenshot, provider, image);
-}
-
-static UIImage *ShelledImageFromScreenshot(id screenshot, UIImage *image) {
-    id provider = nil;
-    @try {
-        if ([screenshot respondsToSelector:@selector(imageProvider)]) {
-            provider = [screenshot imageProvider];
-        }
-    } @catch (__unused NSException *e) {
-    }
-    return ShelledImageForScreenshot(screenshot, provider, image);
-}
-
-static id WrapImageBlockForProvider(id provider, id block) {
+static id WrapImageBlockWithHost(id host, id block) {
     if (!block) return nil;
 
     void (^origBlock)(id) = [block copy];
     void (^wrappedBlock)(id) = ^(id image) {
-        origBlock(ShelledImageFromProvider(provider, [image isKindOfClass:[UIImage class]] ? (UIImage *)image : nil) ?: image);
-    };
-    return [wrappedBlock copy];
-}
-
-static id WrapImageBlockForScreenshot(id screenshot, id block) {
-    if (!block) return nil;
-
-    void (^origBlock)(id) = [block copy];
-    void (^wrappedBlock)(id) = ^(id image) {
-        origBlock(ShelledImageFromScreenshot(screenshot, [image isKindOfClass:[UIImage class]] ? (UIImage *)image : nil) ?: image);
+        if ([image isKindOfClass:[UIImage class]]) {
+            origBlock(ShellImageForHost(host, (UIImage *)image) ?: image);
+        } else {
+            origBlock(image);
+        }
     };
     return [wrappedBlock copy];
 }
@@ -253,9 +218,6 @@ static id WrapImageBlockForScreenshot(id screenshot, id block) {
 // --------------------------------------------------------
 %group ScreenshotCoreHook
 
-// --------------------------------------------------------
-// 1) 模型层：这是最关键的写回点
-// --------------------------------------------------------
 %hook SSSScreenshot
 
 - (void)setBackingImage:(UIImage *)image {
@@ -264,14 +226,14 @@ static id WrapImageBlockForScreenshot(id screenshot, id block) {
         return;
     }
 
-    // 如果这张截图生命周期里已经套过壳，后面再来的 backingImage 直接复用已处理结果
-    if (ScreenshotShellApplied(self)) {
-        UIImage *cached = [self backingImage];
-        %orig(cached ?: image);
+    // 先看这张截图是否已经有最终壳图缓存
+    UIImage *cached = HostShelledImage(self);
+    if (cached) {
+        %orig(cached);
         return;
     }
 
-    UIImage *shelled = ShelledImageFromScreenshot(self, image);
+    UIImage *shelled = ShellImageForHost(self, image);
     %orig(shelled ?: image);
 }
 
@@ -281,30 +243,32 @@ static id WrapImageBlockForScreenshot(id screenshot, id block) {
         return;
     }
 
-    id wrappedBlock = WrapImageBlockForScreenshot(self, block);
-    %orig(transition, wrappedBlock);
+    id wrapped = WrapImageBlockWithHost(self, block);
+    %orig(transition, wrapped);
 }
 
 %end
 
-// --------------------------------------------------------
-// 2) 首屏展示 / 编辑流 / 保存流
-//    这里保留，但只允许“首次命中时合成一次”
-// --------------------------------------------------------
 %hook SSSScreenshotImageProvider
 
 - (id)requestCGImageBackedUneditedImageForUIBlocking {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShelledImageFromProvider(self, (UIImage *)image) ?: image;
+
+    SSSScreenshot *shot = nil;
+    @try { shot = [self screenshot]; } @catch (__unused NSException *e) {}
+    return ShellImageForHost(shot ?: self, (UIImage *)image) ?: image;
 }
 
 - (id)requestUneditedImageForUIBlocking {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShelledImageFromProvider(self, (UIImage *)image) ?: image;
+
+    SSSScreenshot *shot = nil;
+    @try { shot = [self screenshot]; } @catch (__unused NSException *e) {}
+    return ShellImageForHost(shot ?: self, (UIImage *)image) ?: image;
 }
 
 - (void)requestCGImageBackedUneditedImageForUI:(id)ui {
@@ -312,7 +276,10 @@ static id WrapImageBlockForScreenshot(id screenshot, id block) {
         %orig(ui);
         return;
     }
-    id wrapped = WrapImageBlockForProvider(self, ui);
+
+    SSSScreenshot *shot = nil;
+    @try { shot = [self screenshot]; } @catch (__unused NSException *e) {}
+    id wrapped = WrapImageBlockWithHost(shot ?: self, ui);
     %orig(wrapped);
 }
 
@@ -321,7 +288,10 @@ static id WrapImageBlockForScreenshot(id screenshot, id block) {
         %orig(ui);
         return;
     }
-    id wrapped = WrapImageBlockForProvider(self, ui);
+
+    SSSScreenshot *shot = nil;
+    @try { shot = [self screenshot]; } @catch (__unused NSException *e) {}
+    id wrapped = WrapImageBlockWithHost(shot ?: self, ui);
     %orig(wrapped);
 }
 
@@ -329,14 +299,20 @@ static id WrapImageBlockForScreenshot(id screenshot, id block) {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShelledImageFromProvider(self, (UIImage *)image) ?: image;
+
+    SSSScreenshot *shot = nil;
+    @try { shot = [self screenshot]; } @catch (__unused NSException *e) {}
+    return ShellImageForHost(shot ?: self, (UIImage *)image) ?: image;
 }
 
 - (id)requestOutputImageForSavingBlocking {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
     if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShelledImageFromProvider(self, (UIImage *)image) ?: image;
+
+    SSSScreenshot *shot = nil;
+    @try { shot = [self screenshot]; } @catch (__unused NSException *e) {}
+    return ShellImageForHost(shot ?: self, (UIImage *)image) ?: image;
 }
 
 - (void)requestOutputImageForUI:(id)block {
@@ -344,7 +320,10 @@ static id WrapImageBlockForScreenshot(id screenshot, id block) {
         %orig(block);
         return;
     }
-    id wrapped = WrapImageBlockForProvider(self, block);
+
+    SSSScreenshot *shot = nil;
+    @try { shot = [self screenshot]; } @catch (__unused NSException *e) {}
+    id wrapped = WrapImageBlockWithHost(shot ?: self, block);
     %orig(wrapped);
 }
 
@@ -353,7 +332,10 @@ static id WrapImageBlockForScreenshot(id screenshot, id block) {
         %orig(block);
         return;
     }
-    id wrapped = WrapImageBlockForProvider(self, block);
+
+    SSSScreenshot *shot = nil;
+    @try { shot = [self screenshot]; } @catch (__unused NSException *e) {}
+    id wrapped = WrapImageBlockWithHost(shot ?: self, block);
     %orig(wrapped);
 }
 
@@ -362,45 +344,11 @@ static id WrapImageBlockForScreenshot(id screenshot, id block) {
         %orig(transition, block);
         return;
     }
-    id wrapped = WrapImageBlockForProvider(self, block);
+
+    SSSScreenshot *shot = nil;
+    @try { shot = [self screenshot]; } @catch (__unused NSException *e) {}
+    id wrapped = WrapImageBlockWithHost(shot ?: self, block);
     %orig(transition, wrapped);
-}
-
-%end
-
-// --------------------------------------------------------
-// 3) 这里不要再套壳了
-//    PHAsset 层已经太晚，极容易把已处理图片再处理一次
-//    只保留原样透传，避免壳中壳
-// --------------------------------------------------------
-%hook PHAssetCreationRequest
-
-+ (instancetype)creationRequestForAssetFromImage:(UIImage *)image {
-    return %orig(image);
-}
-
-+ (instancetype)creationRequestForAssetFromImageAtFileURL:(NSURL *)fileURL {
-    return %orig(fileURL);
-}
-
-- (void)addResourceWithType:(long long)type data:(NSData *)data options:(id)options {
-    %orig(type, data, options);
-}
-
-- (void)addResourceWithType:(long long)type fileURL:(NSURL *)fileURL options:(id)options {
-    %orig(type, fileURL, options);
-}
-
-%end
-
-%hook PHAssetChangeRequest
-
-+ (instancetype)creationRequestForAssetFromImage:(UIImage *)image {
-    return %orig(image);
-}
-
-+ (instancetype)creationRequestForAssetFromImageAtFileURL:(NSURL *)fileURL {
-    return %orig(fileURL);
 }
 
 %end
