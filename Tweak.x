@@ -37,15 +37,9 @@
 - (void)requestOutputImageInTransition:(_Bool)transition forSaving:(id /* block */)block;
 @end
 
-@interface _SSSScreenshotImageView : UIView
+@interface SSSScreenshotView : UIView
 - (id)screenshot;
 - (void)setScreenshot:(id)screenshot;
-
-- (void)generateSnapshotImageIfNecessary:(_Bool)necessary withCompletion:(id /* block */)completion;
-
-- (void)imageViewDidLoadImage:(id)image;
-- (void)_paperKitImageView:(id)view didFinishUpdatingImage:(id)image;
-- (void)_paperKitImageView:(id)view willBeginUpdatingImage:(id)image;
 @end
 
 // --------------------------------------------------------
@@ -366,6 +360,17 @@ static void EnsureScreenshotCachedShell(id screenshotObj) {
 
 %end
 
+%hook SSSScreenshotView
+
+- (void)setScreenshot:(id)screenshot {
+    if (isTweakEnabled()) {
+        EnsureScreenshotCachedShell(screenshot);
+    }
+    %orig(screenshot);
+}
+
+%end
+
 %hook SSSScreenshotImageProvider
 
 - (id)requestCGImageBackedUneditedImageForUIBlocking {
@@ -447,84 +452,6 @@ static void EnsureScreenshotCachedShell(id screenshotObj) {
     }
     SSSScreenshot *shot = [self screenshot];
     %orig(transition, WrapImageBlockForScreenshot(shot, block));
-}
-
-%end
-
-%hook _SSSScreenshotImageView
-
-- (void)setScreenshot:(id)screenshot {
-    EnsureScreenshotCachedShell(screenshot);
-    %orig(screenshot);
-}
-
-- (void)generateSnapshotImageIfNecessary:(_Bool)necessary withCompletion:(id)completion {
-    if (!completion || !isTweakEnabled()) {
-        %orig(necessary, completion);
-        return;
-    }
-
-    SSSScreenshot *shot = nil;
-    if ([self respondsToSelector:@selector(screenshot)]) {
-        shot = [self screenshot];
-    }
-
-    id wrapped = WrapImageBlockForScreenshot(shot, completion);
-    %orig(necessary, wrapped);
-}
-
-- (void)imageViewDidLoadImage:(id)image {
-    if (!isTweakEnabled() || ![image isKindOfClass:[UIImage class]]) {
-        %orig(image);
-        return;
-    }
-
-    SSSScreenshot *shot = nil;
-    if ([self respondsToSelector:@selector(screenshot)]) {
-        shot = [self screenshot];
-    }
-
-    UIImage *shell = ShellImageForScreenshot(shot, (UIImage *)image);
-    EnsureScreenshotCachedShell(shot);
-    %orig(shell);
-}
-
-- (void)_paperKitImageView:(id)view didFinishUpdatingImage:(id)image {
-    if (!isTweakEnabled() || ![image isKindOfClass:[UIImage class]]) {
-        %orig(view, image);
-        return;
-    }
-
-    SSSScreenshot *shot = nil;
-    if ([self respondsToSelector:@selector(screenshot)]) {
-        shot = [self screenshot];
-    }
-
-    UIImage *shell = ShellImageForScreenshot(shot, (UIImage *)image);
-    EnsureScreenshotCachedShell(shot);
-    %orig(view, shell);
-}
-
-- (void)_paperKitImageView:(id)view willBeginUpdatingImage:(id)image {
-    if (isTweakEnabled()) {
-        SSSScreenshot *shot = nil;
-        if ([self respondsToSelector:@selector(screenshot)]) {
-            shot = [self screenshot];
-        }
-        EnsureScreenshotCachedShell(shot);
-    }
-    %orig(view, image);
-}
-
-%end
-
-%hook SSSScreenshotView
-
-- (void)setScreenshot:(id)screenshot {
-    if (isTweakEnabled()) {
-        EnsureScreenshotCachedShell(screenshot);
-    }
-    %orig(screenshot);
 }
 
 %end
