@@ -41,10 +41,30 @@ static BOOL isTweakEnabled(void) {
 }
 
 // --------------------------------------------------------
-// 核心：精准合成图像 + 终极防套娃逻辑
+// 防重复套壳标记
+// --------------------------------------------------------
+static const void *kShellAppliedKey = &kShellAppliedKey;
+
+static BOOL IsShelledImage(id obj) {
+    if (!obj) return NO;
+    return [objc_getAssociatedObject(obj, kShellAppliedKey) boolValue];
+}
+
+static void MarkShelledImage(id obj) {
+    if (!obj) return;
+    objc_setAssociatedObject(obj, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// --------------------------------------------------------
+// 工具：图像处理 / 临时文件
 // --------------------------------------------------------
 static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
+
+    // 已经是我们处理过的图，直接返回，避免同一条链路里重复套壳
+    if (IsShelledImage(rawScreenshot)) {
+        return rawScreenshot;
+    }
 
     NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
     NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
@@ -56,20 +76,6 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     CGFloat templateW = [cfg[@"template_width"] doubleValue];
     CGFloat templateH = [cfg[@"template_height"] doubleValue];
     if (templateW <= 0 || templateH <= 0) return rawScreenshot;
-
-    // ==========================================
-    // 终极杀招：物理尺寸防套娃 (彻底解决壳中壳)
-    // ==========================================
-    // 获取当前图片的真实像素尺寸 (不论 scale 是多少，像素点总数是不变的)
-    CGFloat pixelW = rawScreenshot.size.width * rawScreenshot.scale;
-    CGFloat pixelH = rawScreenshot.size.height * rawScreenshot.scale;
-    
-    // 如果图片的像素尺寸已经和模板的尺寸完全吻合（允许极其微小的浮点误差），
-    // 说明这张图之前已经走过套壳流程了，绝对不能再套第二次！直接返回！
-    if (fabs(pixelW - templateW) < 2.0 && fabs(pixelH - templateH) < 2.0) {
-        return rawScreenshot;
-    }
-    // ==========================================
 
     NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
     UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
@@ -86,7 +92,6 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 
     CGSize outSize = CGSizeMake(templateW, templateH);
 
-    // 强制使用比例 1.0 进行渲染，保证最终尺寸绝对服从 config.cfg
     UIGraphicsBeginImageContextWithOptions(outSize, NO, 1.0);
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (ctx) {
@@ -101,47 +106,129 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 
     if (!rendered) return rawScreenshot;
 
-    return [UIImage imageWithCGImage:rendered.CGImage scale:1.0 orientation:UIImageOrientationUp];
+    UIImage *finalImage = [UIImage imageWithCGImage:rendered.CGImage
+                                              scale:1.0
+                                        orientation:UIImageOrientationUp];
+    if (finalImage) {
+        MarkShelledImage(finalImage);
+        return finalImage;
+    }
+
+    return rendered ?: rawScreenshot;
 }
 
+static UIImage *ShellImageIfNeeded(UIImage *image) {
+    if (!image) return nil;
+    UIImage *result = applyShellToScreenshot(image);
+    return result ?: image;
+}
+
+static NSURL *WritePNGToTemporaryURLFromImage(UIImage *image) {
+    if (!image) return nil;
+
+    UIImage *finalImage = ShellImageIfNeeded(image);
+    NSData *png = UIImagePNGRepresentation(finalImage);
+    if (!png) return nil;
+
+    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+    tempPath = [tempPath stringByAppendingPathExtension:@"png"];
+    if (![png writeToFile:tempPath atomically:YES]) return nil;
+
+    return [NSURL fileURLWithPath:tempPath];
+}
+
+static id ShellObjectIfNeeded(id obj) {
+    if (![obj isKindOfClass:[UIImage class]]) return obj;
+    return ShellImageIfNeeded((UIImage *)obj) ?: obj;
+}
 
 // --------------------------------------------------------
 // Hook 注入
 // --------------------------------------------------------
 %group ScreenshotCoreHook
 
-// 模型层拦截
+// 模型层拦截：截图对象刚拿到 backingImage 时就先处理
 %hook SSSScreenshot
+
 - (void)setBackingImage:(UIImage *)image {
     if (image && isTweakEnabled()) {
-        UIImage *shelled = applyShellToScreenshot(image);
-        if (shelled) {
-            %orig(shelled);
-            return;
-        }
+        UIImage *shelled = ShellImageIfNeeded(image);
+        %orig(shelled ?: image);
+        return;
     }
     %orig(image);
 }
+
+// 过渡图入口，某些版本首次预览会走这里
+- (void)requestImageInTransition:(_Bool)transition withBlock:(id)block {
+    if (!block || !isTweakEnabled()) {
+        %orig(transition, block);
+        return;
+    }
+
+    void (^origBlock)(id) = [block copy];
+    void (^wrappedBlock)(id) = ^(id image) {
+        origBlock(ShellObjectIfNeeded(image));
+    };
+
+    %orig(transition, wrappedBlock);
+}
+
 %end
 
-// 界面 UI 和 编辑流拦截
+// 界面 UI / 首次展示 / 编辑流拦截
 %hook SSSScreenshotImageProvider
+
+- (id)requestCGImageBackedUneditedImageForUIBlocking {
+    id image = %orig;
+    if (!image || !isTweakEnabled()) return image;
+    return ShellObjectIfNeeded(image);
+}
+
+- (id)requestUneditedImageForUIBlocking {
+    id image = %orig;
+    if (!image || !isTweakEnabled()) return image;
+    return ShellObjectIfNeeded(image);
+}
+
+- (void)requestCGImageBackedUneditedImageForUI:(id)ui {
+    if (!ui || !isTweakEnabled()) {
+        %orig(ui);
+        return;
+    }
+
+    void (^origBlock)(id) = [ui copy];
+    void (^wrappedBlock)(id) = ^(id image) {
+        origBlock(ShellObjectIfNeeded(image));
+    };
+
+    %orig(wrappedBlock);
+}
+
+- (void)requestUneditedImageForUI:(id)ui {
+    if (!ui || !isTweakEnabled()) {
+        %orig(ui);
+        return;
+    }
+
+    void (^origBlock)(id) = [ui copy];
+    void (^wrappedBlock)(id) = ^(id image) {
+        origBlock(ShellObjectIfNeeded(image));
+    };
+
+    %orig(wrappedBlock);
+}
+
 - (id)requestOutputImageForUIBlocking {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
-    if ([image isKindOfClass:[UIImage class]]) {
-        return applyShellToScreenshot((UIImage *)image) ?: image;
-    }
-    return image;
+    return ShellObjectIfNeeded(image);
 }
 
 - (id)requestOutputImageForSavingBlocking {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
-    if ([image isKindOfClass:[UIImage class]]) {
-        return applyShellToScreenshot((UIImage *)image) ?: image;
-    }
-    return image;
+    return ShellObjectIfNeeded(image);
 }
 
 - (void)requestOutputImageForUI:(id)block {
@@ -149,14 +236,12 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
         %orig(block);
         return;
     }
+
     void (^origBlock)(id) = [block copy];
     void (^wrappedBlock)(id) = ^(id image) {
-        if ([image isKindOfClass:[UIImage class]]) {
-            origBlock(applyShellToScreenshot((UIImage *)image) ?: image);
-        } else {
-            origBlock(image);
-        }
+        origBlock(ShellObjectIfNeeded(image));
     };
+
     %orig(wrappedBlock);
 }
 
@@ -165,24 +250,38 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
         %orig(block);
         return;
     }
+
     void (^origBlock)(id) = [block copy];
     void (^wrappedBlock)(id) = ^(id image) {
-        if ([image isKindOfClass:[UIImage class]]) {
-            origBlock(applyShellToScreenshot((UIImage *)image) ?: image);
-        } else {
-            origBlock(image);
-        }
+        origBlock(ShellObjectIfNeeded(image));
     };
+
     %orig(wrappedBlock);
 }
+
+// 过渡输出，编辑/保存时兜底
+- (void)requestOutputImageInTransition:(_Bool)transition forSaving:(id)block {
+    if (!block || !isTweakEnabled()) {
+        %orig(transition, block);
+        return;
+    }
+
+    void (^origBlock)(id) = [block copy];
+    void (^wrappedBlock)(id) = ^(id image) {
+        origBlock(ShellObjectIfNeeded(image));
+    };
+
+    %orig(transition, wrappedBlock);
+}
+
 %end
 
-// 相册保存最底层拦截 (负责解决“不编辑不存图”的问题)
+// 相册保存最底层拦截
 %hook PHAssetCreationRequest
 
 + (instancetype)creationRequestForAssetFromImage:(UIImage *)image {
     if (image && isTweakEnabled()) {
-        UIImage *shelled = applyShellToScreenshot(image);
+        UIImage *shelled = ShellImageIfNeeded(image);
         if (shelled) {
             return %orig(shelled);
         }
@@ -196,16 +295,9 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
         if (data) {
             UIImage *rawImage = [UIImage imageWithData:data];
             if (rawImage) {
-                UIImage *shelled = applyShellToScreenshot(rawImage);
-                if (shelled) {
-                    NSData *png = UIImagePNGRepresentation(shelled);
-                    if (png) {
-                        NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
-                        tempPath = [tempPath stringByAppendingPathExtension:@"png"];
-                        if ([png writeToFile:tempPath atomically:YES]) {
-                            return %orig([NSURL fileURLWithPath:tempPath]);
-                        }
-                    }
+                NSURL *tempURL = WritePNGToTemporaryURLFromImage(rawImage);
+                if (tempURL) {
+                    return %orig(tempURL);
                 }
             }
         }
@@ -217,7 +309,7 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     if (type == 1 && data && isTweakEnabled()) {
         UIImage *rawImage = [UIImage imageWithData:data];
         if (rawImage) {
-            UIImage *shelled = applyShellToScreenshot(rawImage);
+            UIImage *shelled = ShellImageIfNeeded(rawImage);
             if (shelled) {
                 NSData *png = UIImagePNGRepresentation(shelled);
                 if (png) {
@@ -236,30 +328,24 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
         if (data) {
             UIImage *rawImage = [UIImage imageWithData:data];
             if (rawImage) {
-                UIImage *shelled = applyShellToScreenshot(rawImage);
-                if (shelled) {
-                    NSData *png = UIImagePNGRepresentation(shelled);
-                    if (png) {
-                        NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
-                        tempPath = [tempPath stringByAppendingPathExtension:@"png"];
-                        if ([png writeToFile:tempPath atomically:YES]) {
-                            %orig(type, [NSURL fileURLWithPath:tempPath], options);
-                            return;
-                        }
-                    }
+                NSURL *tempURL = WritePNGToTemporaryURLFromImage(rawImage);
+                if (tempURL) {
+                    %orig(type, tempURL, options);
+                    return;
                 }
             }
         }
     }
     %orig(type, fileURL, options);
 }
+
 %end
 
 %hook PHAssetChangeRequest
 
 + (instancetype)creationRequestForAssetFromImage:(UIImage *)image {
     if (image && isTweakEnabled()) {
-        UIImage *shelled = applyShellToScreenshot(image);
+        UIImage *shelled = ShellImageIfNeeded(image);
         if (shelled) {
             return %orig(shelled);
         }
@@ -273,22 +359,16 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
         if (data) {
             UIImage *rawImage = [UIImage imageWithData:data];
             if (rawImage) {
-                UIImage *shelled = applyShellToScreenshot(rawImage);
-                if (shelled) {
-                    NSData *png = UIImagePNGRepresentation(shelled);
-                    if (png) {
-                        NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
-                        tempPath = [tempPath stringByAppendingPathExtension:@"png"];
-                        if ([png writeToFile:tempPath atomically:YES]) {
-                            return %orig([NSURL fileURLWithPath:tempPath]);
-                        }
-                    }
+                NSURL *tempURL = WritePNGToTemporaryURLFromImage(rawImage);
+                if (tempURL) {
+                    return %orig(tempURL);
                 }
             }
         }
     }
     return %orig(fileURL);
 }
+
 %end
 
 %end // ScreenshotCoreHook
