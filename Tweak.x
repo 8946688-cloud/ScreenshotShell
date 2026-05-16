@@ -8,13 +8,14 @@
 #endif
 
 // --------------------------------------------------------
-// 声明私有头文件
+// 声明私有头文件 (匹配 iOS 14-17)
 // --------------------------------------------------------
 @interface SSEnvironmentDescription : NSObject
 - (void)setImageSurface:(id)surface; 
 @end
 
 @interface SSSScreenshot : NSObject
+@property (retain, nonatomic) UIImage *backingImage;
 @property (readonly, nonatomic) SSEnvironmentDescription *environmentDescription;
 @end
 
@@ -45,20 +46,16 @@ static NSString * GetPlistPath() {
 #endif
 }
 
-// 解决沙盒读取偏好设置失败的备用方案
 static BOOL isTweakEnabled() {
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
     if (prefs && prefs[@"Enabled"] != nil) {
         return [prefs[@"Enabled"] boolValue];
     }
-    // 降级使用 CFPreferences，无视沙盒阻拦
-    Boolean valid = NO;
-    Boolean value = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), CFSTR("com.iosdump.screenshotshell"), &valid);
-    return valid ? value : NO;
+    return NO;
 }
 
 // --------------------------------------------------------
-// 核心：基于安全内存的防爆像素渲染算法
+// 核心：强制透明画布 + 内存防爆缩放算法
 // --------------------------------------------------------
 static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
@@ -93,13 +90,10 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
         CGFloat innerH = lby - lty;
         if (innerW <= 0 || innerH <= 0) return rawScreenshot;
 
-        // ⚠️ 极其关键【内存防爆机制】：
-        // 算出系统原图的真实像素大小
+        // 【内存防爆 + 完美对齐】根据真实截图尺寸等比缩放整个画布
         CGFloat rawPixelW = rawScreenshot.size.width * rawScreenshot.scale;
-        // 计算缩放比例：用手机截图真实宽度 ÷ cfg窟窿的宽度
         CGFloat safeScale = rawPixelW / innerW;
         
-        // 动态将 3000 多像素的 CFG 画布，等比压缩到适应你手机物理分辨率的安全大小！
         CGFloat safeCanvasW = templateW * safeScale;
         CGFloat safeCanvasH = templateH * safeScale;
         CGFloat safeLtx = ltx * safeScale;
@@ -109,19 +103,21 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
         
         if (@available(iOS 10.0, *)) {
             UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
-            format.scale = 1.0;  // 必须是 1.0，依靠上面的真实像素点映射
-            format.opaque = NO;
+            format.scale = 1.0; 
+            format.opaque = NO; // 开启透明通道
             
             UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(safeCanvasW, safeCanvasH) format:format];
             
             UIImage *renderedImage = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull context) {
+                // ⚠️ 重点修复：强制擦除整个画布，消除底层系统的黑底/白底，还你完美的 PNG 透明！
+                CGContextClearRect(context.CGContext, CGRectMake(0, 0, safeCanvasW, safeCanvasH));
+                
                 // 底层：塞入原图
                 [rawScreenshot drawInRect:CGRectMake(safeLtx, safeLty, safeInnerW, safeInnerH)];
-                // 顶层：覆盖安全缩放后的壳（iOS底层绘制会自动下采样优化内存）
+                // 顶层：覆盖带有透明窟窿的手机壳
                 [shellImage drawInRect:CGRectMake(0, 0, safeCanvasW, safeCanvasH)];
             }];
             
-            // 生成后，赋予屏幕原始的 Retina 缩放倍率，完美清晰！
             finalImage = [UIImage imageWithCGImage:renderedImage.CGImage scale:rawScreenshot.scale orientation:rawScreenshot.imageOrientation];
         }
     }
@@ -129,11 +125,11 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
 }
 
 // --------------------------------------------------------
-// Hook 核心：UI 替换 + 底层文件存入替换
+// Hook 核心：UI 替换 + 相册底层沙盒穿透
 // --------------------------------------------------------
 %group ScreenshotCoreHook
 
-// 1. 替换 UI 显示
+// 1. 替换左下角悬浮窗和编辑器内的 UI 显示
 %hook SSSScreenshot
 - (void)setBackingImage:(UIImage *)image {
     if (image && isTweakEnabled()) {
@@ -142,6 +138,7 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
             %orig(shelledImage);
             SSEnvironmentDescription *envDesc = [self environmentDescription];
             if (envDesc && [envDesc respondsToSelector:@selector(setImageSurface:)]) {
+                // 重置原生的剪裁框
                 [envDesc setImageSurface:nil];
             }
             return;
@@ -151,41 +148,54 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
 }
 %end
 
-// 2. 彻底接管底层相册写入
+// 2. 彻底接管底层相册写入 (带防循环保护和沙盒穿透)
 %hook PHAssetCreationRequest
 
 - (void)addResourceWithType:(long long)type data:(NSData *)data options:(id)options {
-    if (type == 1 && data && isTweakEnabled()) {
+    NSMutableDictionary *threadDict = [[NSThread currentThread] threadDictionary];
+    // 拦截标志，防止发生无限循环调用
+    if (type == 1 && data && isTweakEnabled() && ![threadDict objectForKey:@"ScreenshotShell_Processing"]) {
+        [threadDict setObject:@YES forKey:@"ScreenshotShell_Processing"];
+        
         UIImage *rawImage = [UIImage imageWithData:data];
         if (rawImage) {
             UIImage *shelled = applyShellToScreenshot(rawImage);
             if (shelled && shelled != rawImage) {
+                // 强制输出为 PNG 以保留透明通道
                 NSData *shelledData = UIImagePNGRepresentation(shelled);
-                %orig(type, shelledData, options);
-                return;
+                if (shelledData) {
+                    %orig(type, shelledData, options);
+                    [threadDict removeObjectForKey:@"ScreenshotShell_Processing"];
+                    return;
+                }
             }
         }
+        [threadDict removeObjectForKey:@"ScreenshotShell_Processing"];
     }
     %orig;
 }
 
 - (void)addResourceWithType:(long long)type fileURL:(NSURL *)fileURL options:(id)options {
-    if (type == 1 && fileURL && isTweakEnabled()) {
+    NSMutableDictionary *threadDict = [[NSThread currentThread] threadDictionary];
+    if (type == 1 && fileURL && isTweakEnabled() && ![threadDict objectForKey:@"ScreenshotShell_Processing"]) {
+        [threadDict setObject:@YES forKey:@"ScreenshotShell_Processing"];
+        
         UIImage *rawImage = [UIImage imageWithContentsOfFile:fileURL.path];
         if (rawImage) {
             UIImage *shelled = applyShellToScreenshot(rawImage);
             if (shelled && shelled != rawImage) {
                 NSData *shelledData = UIImagePNGRepresentation(shelled);
-                
-                // ⚠️ 极其关键【沙盒穿透】：
-                // 不要新建临时文件（相册无权读取），直接覆盖系统给定的这个原本要存入的 fileURL ！
-                // 因为系统已经分配好了相册读取权限，狸猫换太子最安全！
-                [shelledData writeToFile:fileURL.path atomically:YES];
-                
-                %orig(type, fileURL, options);
-                return;
+                if (shelledData) {
+                    // ⚠️ 极其关键【沙盒穿透】：
+                    // 我们放弃往 fileURL 写入文件（因为没权限），而是直接调用当前对象的 data 保存方法！
+                    // 这绕过了所有的文件沙盒锁，直接把带壳 PNG 数据塞进了相册！
+                    [self addResourceWithType:type data:shelledData options:options];
+                    [threadDict removeObjectForKey:@"ScreenshotShell_Processing"];
+                    return;
+                }
             }
         }
+        [threadDict removeObjectForKey:@"ScreenshotShell_Processing"];
     }
     %orig;
 }
@@ -196,8 +206,10 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
 // 构造入口
 // --------------------------------------------------------
 %ctor {
-    // ⚠️ 极其关键【进程全接管】：
-    // 移除了只监听 com.apple.ScreenshotServicesService 的限制！
-    // 这样如果你截图后直接左滑隐藏，SpringBoard 进程也会触发相册保存拦截，做到 100% 覆盖。
-    %init(ScreenshotCoreHook);
+    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
+    // 精准注入负责处理截图和相册保存的两个核心进程
+    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"] ||
+        [bundleId isEqualToString:@"com.apple.springboard"]) {
+        %init(ScreenshotCoreHook);
+    }
 }
