@@ -1,14 +1,34 @@
 #import <UIKit/UIKit.h>
+#import <Photos/Photos.h>
 #import <objc/runtime.h>
 
-// ========== 获取适配越狱环境的路径 ==========
 #if __has_include(<roothide.h>)
 #import <roothide.h>
 #else
 #define jbroot(path) path
 #endif
 
-static NSString * GetPrefDir() {
+// --------------------------------------------------------
+// 私有头文件声明
+// --------------------------------------------------------
+@interface SSEnvironmentDescription : NSObject
+- (void)setImageSurface:(id)surface;
+@end
+
+@interface SSSScreenshot : NSObject
+@property (retain, nonatomic) UIImage *backingImage;
+@property (readonly, nonatomic) SSEnvironmentDescription *environmentDescription;
+@property (readonly, nonatomic) NSData *imageModificationData;
+- (void)requestImageInTransition:(BOOL)transition withBlock:(id)block;
+// 我们需要用到的底层状态方法
+- (BOOL)hasUnsavedImageEdits;
+- (BOOL)hasEverBeenEditedForMode:(long long)mode;
+@end
+
+// --------------------------------------------------------
+// 路径与配置
+// --------------------------------------------------------
+static NSString *GetPrefDir(void) {
     NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.screenshotshell.media";
 #if __has_include(<roothide.h>)
     return jbroot(base);
@@ -20,7 +40,7 @@ static NSString * GetPrefDir() {
 #endif
 }
 
-static NSString * GetPrefsPath() {
+static NSString *GetPlistPath(void) {
     NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.screenshotshell.plist";
 #if __has_include(<roothide.h>)
     return jbroot(base);
@@ -32,114 +52,169 @@ static NSString * GetPrefsPath() {
 #endif
 }
 
-#define SHELL_IMG_PATH [GetPrefDir() stringByAppendingPathComponent:@"shell.png"]
-#define SHELL_CFG_PATH [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"]
-
-
-// ========== 核心套壳图像处理 ==========
-// 注意：如果你有自己的读取 cfg 坐标和绘图的方法，可以直接替换这里的内部实现
-UIImage *ApplyScreenshotShell(UIImage *originalImage) {
-    if (!originalImage) return nil;
-
-    // 1. 判断全局开关
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPrefsPath()];
-    if (prefs && ![prefs[@"Enabled"] boolValue]) {
-        return originalImage;
-    }
-
-    // 2. 读取透明壳图片
-    UIImage *shellImage = [UIImage imageWithContentsOfFile:SHELL_IMG_PATH];
-    if (!shellImage) return originalImage;
-
-    // 3. 读取并解析 config.cfg
-    // 这里假设 cfg 的格式是用逗号分隔的: x,y,width,height
-    NSString *cfgString = [NSString stringWithContentsOfFile:SHELL_CFG_PATH encoding:NSUTF8StringEncoding error:nil];
-    CGRect screenRect = CGRectZero;
-    
-    if (cfgString && cfgString.length > 0) {
-        NSArray *components = [cfgString componentsSeparatedByString:@","];
-        if (components.count >= 4) {
-            screenRect = CGRectMake([components[0] doubleValue], 
-                                    [components[1] doubleValue], 
-                                    [components[2] doubleValue], 
-                                    [components[3] doubleValue]);
-        }
-    }
-
-    // 如果解析失败，给个默认尺寸兜底
-    if (CGRectIsEmpty(screenRect)) {
-        screenRect = CGRectMake(0, 0, originalImage.size.width, originalImage.size.height);
-    }
-
-    // 4. 开始图像合成
-    UIGraphicsBeginImageContextWithOptions(shellImage.size, NO, 0.0);
-    
-    // ① 先画原始截图 (放在下层)
-    [originalImage drawInRect:screenRect];
-    
-    // ② 再画透明套壳 (放在上层，覆盖截图边缘)
-    [shellImage drawInRect:CGRectMake(0, 0, shellImage.size.width, shellImage.size.height)];
-    
-    UIImage *resultImage = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-
-    return resultImage ?: originalImage;
+static BOOL isTweakEnabled(void) {
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
+    return prefs ? [prefs[@"Enabled"] boolValue] : NO;
 }
 
+// --------------------------------------------------------
+// 读取素材
+// --------------------------------------------------------
+static UIImage *LoadShellImage(void) {
+    NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
+    return [UIImage imageWithContentsOfFile:shellPath];
+}
 
-// ========== 核心 Hook 注入 ==========
+static NSDictionary *LoadConfig(void) {
+    NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
+    NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
+    if (!cfgData) return nil;
+
+    id json = [NSJSONSerialization JSONObjectWithData:cfgData options:0 error:nil];
+    if (![json isKindOfClass:[NSDictionary class]]) return nil;
+    return (NSDictionary *)json;
+}
+
+// --------------------------------------------------------
+// 核心绘图逻辑 (纯函数，不再包含标记逻辑)
+// --------------------------------------------------------
+static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
+    if (!rawScreenshot) return nil;
+
+    UIImage *shellImage = LoadShellImage();
+    if (!shellImage) return rawScreenshot;
+
+    NSDictionary *cfg = LoadConfig();
+    if (!cfg) return rawScreenshot;
+
+    CGFloat templateW = [cfg[@"template_width"] doubleValue];
+    CGFloat templateH = [cfg[@"template_height"] doubleValue];
+    if (templateW <= 0 || templateH <= 0) return rawScreenshot;
+
+    CGFloat ltx = [cfg[@"left_top_x"] doubleValue];
+    CGFloat lty = [cfg[@"left_top_y"] doubleValue];
+    CGFloat rtx = [cfg[@"right_top_x"] doubleValue];
+    CGFloat lby = [cfg[@"left_bottom_y"] doubleValue];
+
+    CGFloat holeW = rtx - ltx;
+    CGFloat holeH = lby - lty;
+    if (holeW <= 0 || holeH <= 0) return rawScreenshot;
+
+    CGSize outSize = CGSizeMake(templateW, templateH);
+
+    UIGraphicsBeginImageContextWithOptions(outSize, NO, 1.0);
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (ctx) {
+        CGContextClearRect(ctx, CGRectMake(0, 0, outSize.width, outSize.height));
+    }
+
+    // 1. 铺截图
+    [rawScreenshot drawInRect:CGRectMake(ltx, lty, holeW, holeH)];
+    // 2. 盖外壳
+    [shellImage drawInRect:CGRectMake(0, 0, outSize.width, outSize.height)];
+
+    UIImage *rendered = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+
+    if (!rendered) return rawScreenshot;
+
+    return [UIImage imageWithCGImage:rendered.CGImage scale:1.0 orientation:UIImageOrientationUp];
+}
+
+// --------------------------------------------------------
+// Hook 注入
+// --------------------------------------------------------
+%group ScreenshotCoreHook
+
 %hook SSSScreenshot
 
-// 修复 Bug 2: 解决多次调用导致的重复套壳（画中画）问题
+// 【修复 Bug 1】：强制告诉系统“这张图我改过”，逼它走后续的渲染保存流程
+- (BOOL)hasUnsavedImageEdits {
+    if (isTweakEnabled()) {
+        return YES;
+    }
+    return %orig;
+}
+
+- (BOOL)hasEverBeenEditedForMode:(long long)mode {
+    if (isTweakEnabled()) {
+        return YES;
+    }
+    return %orig;
+}
+
+// 【修复 Bug 2】：在模型实例 (self) 上打标记，防套娃
 - (UIImage *)backingImage {
     UIImage *orig = %orig;
-    if (!orig) return orig;
+    if (!orig || !isTweakEnabled()) return orig;
 
-    // 检查关联对象，判断当前截图实例是否已经套过壳
+    // 检查这个截图任务是否已经套过壳
     NSNumber *hasShelled = objc_getAssociatedObject(self, @selector(hasShelled));
     if ([hasShelled boolValue]) {
-        return orig; // 已经套过了，直接返回，绝不二次套壳
+        return orig; 
     }
 
     // 执行套壳
-    UIImage *shelledImage = ApplyScreenshotShell(orig);
-    
-    if (shelledImage && shelledImage != orig) {
-        // 【关键步骤】：把套好壳的图片强行写回底层属性
-        [self setBackingImage:shelledImage];
-        
-        // 【关键步骤】：打上标记，防止未来用户编辑图片后保存时再次套壳
+    UIImage *shelled = ApplyShellToScreenshot(orig);
+    if (shelled && shelled != orig) {
+        // 关键：将套好壳的图片塞回模型，并打上永久标记
+        [self setBackingImage:shelled];
         objc_setAssociatedObject(self, @selector(hasShelled), @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        
-        return shelledImage;
+        return shelled;
     }
 
     return orig;
 }
 
-// 修复 Bug 1 (主要): 强制系统认为图片有“未保存的编辑”
-// 这样即使你不画一笔，系统也不会去存那个原始没套壳的屏幕快照，而是乖乖保存我们的 backingImage
-- (BOOL)hasUnsavedImageEdits {
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPrefsPath()];
-    if (prefs && [prefs[@"Enabled"] boolValue]) {
-        NSNumber *hasShelled = objc_getAssociatedObject(self, @selector(hasShelled));
-        if ([hasShelled boolValue]) {
-            return YES; // 强制要求系统走保存渲染流程
-        }
+// 拦截 UI 预览时获取的图片，同步打上标记
+- (void)requestImageInTransition:(BOOL)transition withBlock:(id)block {
+    if (!block || !isTweakEnabled()) {
+        %orig(transition, block);
+        return;
     }
-    return %orig;
+
+    NSNumber *hasShelled = objc_getAssociatedObject(self, @selector(hasShelled));
+    if ([hasShelled boolValue]) {
+        %orig(transition, block);
+        return;
+    }
+
+    void (^origBlock)(id) = [block copy];
+    // 使用 weakSelf 防止 Block 循环引用
+    __weak typeof(self) weakSelf = self;
+    void (^wrappedBlock)(id) = ^(id image) {
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf && [image isKindOfClass:[UIImage class]]) {
+            UIImage *shelled = ApplyShellToScreenshot((UIImage *)image);
+            if (shelled && shelled != image) {
+                [strongSelf setBackingImage:shelled];
+                objc_setAssociatedObject(strongSelf, @selector(hasShelled), @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                origBlock(shelled);
+            } else {
+                origBlock(image);
+            }
+        } else {
+            origBlock(image);
+        }
+    };
+
+    %orig(transition, wrappedBlock);
 }
 
-// 修复 Bug 1 (辅助): 覆盖不同 iOS 版本的检测方法 (iOS 15-17 兼容)
-- (BOOL)hasEverBeenEditedForMode:(long long)mode {
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPrefsPath()];
-    if (prefs && [prefs[@"Enabled"] boolValue]) {
-        NSNumber *hasShelled = objc_getAssociatedObject(self, @selector(hasShelled));
-        if ([hasShelled boolValue]) {
-            return YES;
-        }
-    }
-    return %orig;
-}
+// 注意：彻底删除了 imageModificationData 的 Hook。
+// 因为 backingImage 已经是套好壳的图片，原生系统会自己把它转成 NSData 并保存，多拦截一次必定会导致画中画！
 
 %end
+
+%end // ScreenshotCoreHook
+
+// --------------------------------------------------------
+// 构造入口
+// --------------------------------------------------------
+%ctor {
+    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
+    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"] ||
+        [bundleId isEqualToString:@"com.apple.springboard"]) {
+        %init(ScreenshotCoreHook);
+    }
+}
