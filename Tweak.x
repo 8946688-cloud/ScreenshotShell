@@ -246,12 +246,22 @@ static UIImage *ShellImageIfNeeded(UIImage *image) {
     return applyShellToScreenshot(image) ?: image;
 }
 
-static id WrapImageBlock(id block) {
+// 增加 screenshotObj 参数：从源头杜绝相同截图对象的多次套壳
+static id WrapImageBlock(id block, id screenshotObj) {
     if (!block) return nil;
     void (^origBlock)(id) = [block copy];
     void (^wrappedBlock)(id) = ^(id image) {
         if ([image isKindOfClass:[UIImage class]]) {
-            origBlock(ShellImageIfNeeded((UIImage *)image));
+            if (screenshotObj && [objc_getAssociatedObject(screenshotObj, kShellAppliedKey) boolValue]) {
+                // 如果当前截图模型已经套过壳，直接返回（防止画笔涂鸦破坏边缘后引发壳中壳）
+                origBlock(image);
+            } else {
+                UIImage *shelled = ShellImageIfNeeded((UIImage *)image);
+                if (shelled && shelled != image && screenshotObj) {
+                    objc_setAssociatedObject(screenshotObj, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                origBlock(shelled ?: image);
+            }
         } else {
             origBlock(image);
         }
@@ -266,138 +276,134 @@ static id WrapImageBlock(id block) {
 
 %hook SSSScreenshot
 
+// 核心修复1：截图生成的第一时间直接套壳，解决“没有马上套”的问题
 - (void)setBackingImage:(UIImage *)image {
     if (!isTweakEnabled() || !image) {
         %orig(image);
         return;
     }
     
-    // 检查此截图对象是否已经成功套壳，防止重复处理
-    BOOL alreadyShelled = [objc_getAssociatedObject(self, kShellAppliedKey) boolValue];
-    if (alreadyShelled) {
+    // 如果这个截图实例已经成功处理过，防重入放行
+    if ([objc_getAssociatedObject(self, kShellAppliedKey) boolValue]) {
         %orig(image);
         return;
     }
 
-    // 核心修改：在这里马上套壳，使得左下角缩略图能够立刻生效
     UIImage *shelledImage = ShellImageIfNeeded(image);
-    
-    // 如果套壳成功，在当前截图对象上打上标记
-    if (shelledImage) {
+    if (shelledImage && shelledImage != image) {
+        // 打上成功的强标记
         objc_setAssociatedObject(self, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    
     %orig(shelledImage ?: image);
 }
 
 - (void)requestImageInTransition:(_Bool)transition withBlock:(id)block {
-    BOOL alreadyShelled = [objc_getAssociatedObject(self, kShellAppliedKey) boolValue];
-    
-    if (!block || !isTweakEnabled() || alreadyShelled) {
+    if (!block || !isTweakEnabled()) {
         %orig(transition, block);
         return;
     }
-
-    id wrapped = WrapImageBlock(block);
-    %orig(transition, wrapped);
+    %orig(transition, WrapImageBlock(block, self));
 }
 
 %end
 
 %hook SSSScreenshotImageProvider
 
+// 核心修复2：所有的 Provider 拦截点全部增加 kShellAppliedKey 对象强绑定校验，杜绝编辑导致的“壳中壳”
 - (id)requestCGImageBackedUneditedImageForUIBlocking {
-    SSSScreenshot *ss = [self screenshot];
-    // 核心拦截：如果原图已经被 setBackingImage 套壳，直接返回即可，避免引发壳中壳
-    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) {
-        return %orig;
-    }
-    
     id image = %orig;
-    if (!image || !isTweakEnabled()) return image;
-    if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShellImageIfNeeded((UIImage *)image);
+    if (!image || !isTweakEnabled() || ![image isKindOfClass:[UIImage class]]) return image;
+    
+    SSSScreenshot *ss = [self screenshot];
+    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) return image;
+
+    UIImage *shelled = ShellImageIfNeeded((UIImage *)image);
+    if (shelled && shelled != image && ss) {
+        objc_setAssociatedObject(ss, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return shelled ?: image;
 }
 
 - (id)requestUneditedImageForUIBlocking {
-    SSSScreenshot *ss = [self screenshot];
-    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) {
-        return %orig;
-    }
-    
     id image = %orig;
-    if (!image || !isTweakEnabled()) return image;
-    if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShellImageIfNeeded((UIImage *)image);
+    if (!image || !isTweakEnabled() || ![image isKindOfClass:[UIImage class]]) return image;
+    
+    SSSScreenshot *ss = [self screenshot];
+    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) return image;
+
+    UIImage *shelled = ShellImageIfNeeded((UIImage *)image);
+    if (shelled && shelled != image && ss) {
+        objc_setAssociatedObject(ss, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return shelled ?: image;
 }
 
 - (void)requestCGImageBackedUneditedImageForUI:(id)ui {
-    SSSScreenshot *ss = [self screenshot];
-    if (!ui || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
+    if (!ui || !isTweakEnabled()) {
         %orig(ui);
         return;
     }
-    %orig(WrapImageBlock(ui));
+    %orig(WrapImageBlock(ui, [self screenshot]));
 }
 
 - (void)requestUneditedImageForUI:(id)ui {
-    SSSScreenshot *ss = [self screenshot];
-    if (!ui || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
+    if (!ui || !isTweakEnabled()) {
         %orig(ui);
         return;
     }
-    %orig(WrapImageBlock(ui));
+    %orig(WrapImageBlock(ui, [self screenshot]));
 }
 
 - (id)requestOutputImageForUIBlocking {
-    SSSScreenshot *ss = [self screenshot];
-    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) {
-        return %orig;
-    }
-    
     id image = %orig;
-    if (!image || !isTweakEnabled()) return image;
-    if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShellImageIfNeeded((UIImage *)image);
+    if (!image || !isTweakEnabled() || ![image isKindOfClass:[UIImage class]]) return image;
+    
+    SSSScreenshot *ss = [self screenshot];
+    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) return image;
+
+    UIImage *shelled = ShellImageIfNeeded((UIImage *)image);
+    if (shelled && shelled != image && ss) {
+        objc_setAssociatedObject(ss, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return shelled ?: image;
 }
 
 - (id)requestOutputImageForSavingBlocking {
-    SSSScreenshot *ss = [self screenshot];
-    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) {
-        return %orig;
-    }
-    
     id image = %orig;
-    if (!image || !isTweakEnabled()) return image;
-    if (![image isKindOfClass:[UIImage class]]) return image;
-    return ShellImageIfNeeded((UIImage *)image);
+    if (!image || !isTweakEnabled() || ![image isKindOfClass:[UIImage class]]) return image;
+    
+    SSSScreenshot *ss = [self screenshot];
+    if (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue]) return image;
+
+    UIImage *shelled = ShellImageIfNeeded((UIImage *)image);
+    if (shelled && shelled != image && ss) {
+        objc_setAssociatedObject(ss, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return shelled ?: image;
 }
 
 - (void)requestOutputImageForUI:(id)block {
-    SSSScreenshot *ss = [self screenshot];
-    if (!block || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
+    if (!block || !isTweakEnabled()) {
         %orig(block);
         return;
     }
-    %orig(WrapImageBlock(block));
+    %orig(WrapImageBlock(block, [self screenshot]));
 }
 
 - (void)requestOutputImageForSaving:(id)block {
-    SSSScreenshot *ss = [self screenshot];
-    if (!block || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
+    if (!block || !isTweakEnabled()) {
         %orig(block);
         return;
     }
-    %orig(WrapImageBlock(block));
+    %orig(WrapImageBlock(block, [self screenshot]));
 }
 
 - (void)requestOutputImageInTransition:(_Bool)transition forSaving:(id)block {
-    SSSScreenshot *ss = [self screenshot];
-    if (!block || !isTweakEnabled() || (ss && [objc_getAssociatedObject(ss, kShellAppliedKey) boolValue])) {
+    if (!block || !isTweakEnabled()) {
         %orig(transition, block);
         return;
     }
-    %orig(transition, WrapImageBlock(block));
+    %orig(transition, WrapImageBlock(block, [self screenshot]));
 }
 
 %end
