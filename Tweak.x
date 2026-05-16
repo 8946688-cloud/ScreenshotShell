@@ -11,8 +11,7 @@
 // 声明私有头文件
 // --------------------------------------------------------
 @interface SSEnvironmentDescription : NSObject
-@property (nonatomic) CGSize imagePixelSize;
-@property (nonatomic) double imageScale;
+- (void)setImageSurface:(id)surface; 
 @end
 
 @interface SSSScreenshot : NSObject
@@ -47,13 +46,18 @@ static NSString * GetPlistPath() {
 #endif
 }
 
+static BOOL isTweakEnabled() {
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
+    return prefs ? [prefs[@"Enabled"] boolValue] : NO;
+}
+
 // --------------------------------------------------------
-// 核心：基于取整与直接输出的完美透明渲染算法
+// 核心：外壳尺寸锁死算法 (壳绝对不变，截图塞进洞里)
 // --------------------------------------------------------
 static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
     
-    // ⚠️ 防死循环标记，保证只套壳一次
+    // 防重复套壳标记
     if ([rawScreenshot.accessibilityIdentifier isEqualToString:@"ScreenshotShell_Done"]) {
         return rawScreenshot;
     }
@@ -69,69 +73,69 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:0 error:nil];
     if (![cfg isKindOfClass:[NSDictionary class]]) return rawScreenshot;
 
-    CGFloat rawW = rawScreenshot.size.width * rawScreenshot.scale;
-    CGFloat rawH = rawScreenshot.size.height * rawScreenshot.scale;
-
+    // ⚠️ 终极改动：直接读取外壳的原始绝对像素！
+    // 不管截图怎么被裁剪，画布永远是外壳的大小！
     CGFloat templateW = [cfg[@"template_width"] doubleValue];
     CGFloat templateH = [cfg[@"template_height"] doubleValue];
+    if (templateW <= 0 || templateH <= 0) {
+        templateW = shellImage.size.width;
+        templateH = shellImage.size.height;
+    }
 
-    // 仅提取我们需要用到的四个有效坐标，避免出现 unused variable 编译错误
     CGFloat ltx = [cfg[@"left_top_x"] doubleValue];
     CGFloat lty = [cfg[@"left_top_y"] doubleValue];
     CGFloat rtx = [cfg[@"right_top_x"] doubleValue];
     CGFloat lby = [cfg[@"left_bottom_y"] doubleValue];
 
-    // 计算内部洞的实际宽和高
     CGFloat holeW = rtx - ltx;
     CGFloat holeH = lby - lty;
     if (holeW <= 0 || holeH <= 0) return rawScreenshot;
 
-    CGFloat scaleX = rawW / holeW;
-    CGFloat scaleY = rawH / holeH;
-    CGFloat scale = MIN(scaleX, scaleY);
+    __block UIImage *finalImage = nil;
 
-    // ⚠️ 关键点：统一使用 round 取整，防止出现半像素抗锯齿导致的黑白边缝隙
-    CGFloat canvasW = round(templateW * scale);
-    CGFloat canvasH = round(templateH * scale);
+    @autoreleasepool {
+        // ⚠️ 开启透明底色上下文，画布大小死死锁定为壳的原始大小！
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(templateW, templateH), NO, 1.0);
+        CGContextRef ctx = UIGraphicsGetCurrentContext();
+        CGContextClearRect(ctx, CGRectMake(0, 0, templateW, templateH));
 
-    CGFloat drawX = round(ltx * scale);
-    CGFloat drawY = round(lty * scale);
-    CGFloat drawW = round(holeW * scale);
-    CGFloat drawH = round(holeH * scale);
+        // 1. 底层：把截图强行拉伸/压缩，严丝合缝地填满 CFG 标记的那个窟窿坐标
+        [rawScreenshot drawInRect:CGRectMake(ltx, lty, holeW, holeH)];
 
-    UIGraphicsBeginImageContextWithOptions(CGSizeMake(canvasW, canvasH), NO, 1.0);
-    CGContextRef ctx = UIGraphicsGetCurrentContext();
-    CGContextClearRect(ctx, CGRectMake(0, 0, canvasW, canvasH));
+        // 2. 顶层：从 (0,0) 开始铺满原汁原味、大小分毫不差的手机壳
+        [shellImage drawInRect:CGRectMake(0, 0, templateW, templateH)];
 
-    [rawScreenshot drawInRect:CGRectMake(drawX, drawY, drawW, drawH)];
-    [shellImage drawInRect:CGRectMake(0, 0, canvasW, canvasH)];
+        UIImage *renderedImage = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
 
-    UIImage *renderedImage = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-
-    if (renderedImage) {
-        renderedImage.accessibilityIdentifier = @"ScreenshotShell_Done";
+        if (renderedImage && renderedImage.CGImage) {
+            // scale 保持 1.0，这意味着最终输出的就是绝对物理像素 (比如 3370x5996)
+            finalImage = [UIImage imageWithCGImage:renderedImage.CGImage scale:1.0 orientation:UIImageOrientationUp];
+            finalImage.accessibilityIdentifier = @"ScreenshotShell_Done"; // 打上处理完毕烙印
+        }
     }
 
-    // ⚠️ 关键点：不再二次包一层 scale，直接原封不动返回当前画出来的纯净图片对象
-    return renderedImage ?: rawScreenshot;
+    return finalImage ?: rawScreenshot;
 }
 
 // --------------------------------------------------------
-// Hook 核心：回归稳定版拦截，去除多余操作
+// Hook 核心：海陆空全面封锁保存路径
 // --------------------------------------------------------
 %group ScreenshotCoreHook
 
-// 1. 专门骗过 UI：让左下角小窗口显示带壳图片
+// 专门骗过 UI：修改左下角预览窗
 %hook SSSScreenshot
 - (void)setBackingImage:(UIImage *)image {
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
-    if (image && prefs && [prefs[@"Enabled"] boolValue]) {
+    if (image && isTweakEnabled()) {
         UIImage *shelledImage = applyShellToScreenshot(image);
         if (shelledImage && shelledImage != image) {
-            
-            // ⚠️ 关键点：直接覆盖原图交给系统，不再调用 setImageSurface:nil 导致整个 UI 图层消失！
             %orig(shelledImage);
+            
+            // 防 UI 崩溃
+            SSEnvironmentDescription *envDesc = [self environmentDescription];
+            if (envDesc && [envDesc respondsToSelector:@selector(setImageSurface:)]) {
+                [envDesc setImageSurface:nil];
+            }
             return;
         }
     }
@@ -139,12 +143,45 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
 }
 %end
 
-// 2. 专门骗过相册：拦截系统自身真正的保存动作！
+
+// 专门拦截相册：封死所有“直接滑动保存”的隐蔽类方法与实例方法
 %hook PHAssetCreationRequest
 
+// 拦截类方法 1 (内存图直接保存)
++ (instancetype)creationRequestForAssetFromImage:(UIImage *)image {
+    if (image && isTweakEnabled()) {
+        UIImage *shelled = applyShellToScreenshot(image);
+        if (shelled && shelled != image) {
+            return %orig(shelled);
+        }
+    }
+    return %orig(image);
+}
+
+// 拦截类方法 2 (缓存文件直接保存 - 这是导致你不点编辑就没壳的最大元凶)
++ (instancetype)creationRequestForAssetFromImageAtFileURL:(NSURL *)fileURL {
+    if (fileURL && isTweakEnabled()) {
+        UIImage *rawImage = [UIImage imageWithContentsOfFile:fileURL.path];
+        if (rawImage) {
+            UIImage *shelled = applyShellToScreenshot(rawImage);
+            if (shelled && shelled != rawImage) {
+                NSData *shelledData = UIImagePNGRepresentation(shelled);
+                if (shelledData) {
+                    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+                    tempPath = [tempPath stringByAppendingPathExtension:@"png"];
+                    if ([shelledData writeToFile:tempPath atomically:YES]) {
+                        return %orig([NSURL fileURLWithPath:tempPath]);
+                    }
+                }
+            }
+        }
+    }
+    return %orig(fileURL);
+}
+
+// 拦截实例方法 1 (二进制流保存)
 - (void)addResourceWithType:(long long)type data:(NSData *)data options:(id)options {
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
-    if (type == 1 && data && prefs && [prefs[@"Enabled"] boolValue]) {
+    if (type == 1 && data && isTweakEnabled()) {
         UIImage *rawImage = [UIImage imageWithData:data];
         if (rawImage) {
             UIImage *shelled = applyShellToScreenshot(rawImage);
@@ -160,16 +197,15 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     %orig;
 }
 
+// 拦截实例方法 2 (文件流保存)
 - (void)addResourceWithType:(long long)type fileURL:(NSURL *)fileURL options:(id)options {
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
-    if (type == 1 && fileURL && prefs && [prefs[@"Enabled"] boolValue]) {
+    if (type == 1 && fileURL && isTweakEnabled()) {
         UIImage *rawImage = [UIImage imageWithContentsOfFile:fileURL.path];
         if (rawImage) {
             UIImage *shelled = applyShellToScreenshot(rawImage);
             if (shelled && shelled != rawImage) {
                 NSData *shelledData = UIImagePNGRepresentation(shelled);
                 if (shelledData) {
-                    // 使用最稳妥的临时文件大法，保证权限无懈可击
                     NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
                     tempPath = [tempPath stringByAppendingPathExtension:@"png"];
                     [shelledData writeToFile:tempPath atomically:YES];
@@ -183,7 +219,6 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     }
     %orig;
 }
-
 %end // PHAssetCreationRequest
 
 %end // ScreenshotCoreHook
