@@ -13,6 +13,8 @@
 // ========================================================
 
 @class SSSScreenshotImageProvider;
+@class SSSScreenshotView;
+@class _SSSScreenshotImageView;
 
 @interface SSSScreenshot : NSObject
 - (void)setBackingImage:(UIImage *)image;
@@ -246,6 +248,29 @@ static UIImage *ShellImageIfNeeded(UIImage *image) {
     return applyShellToScreenshot(image) ?: image;
 }
 
+static void ApplyShellToScreenshotObject(id screenshotObj) {
+    if (!screenshotObj || !isTweakEnabled()) return;
+    if (![screenshotObj respondsToSelector:@selector(backingImage)] ||
+        ![screenshotObj respondsToSelector:@selector(setBackingImage:)]) {
+        return;
+    }
+
+    NSNumber *busy = objc_getAssociatedObject(screenshotObj, kShellBusyKey);
+    if (busy.boolValue) return;
+
+    objc_setAssociatedObject(screenshotObj, kShellBusyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    UIImage *image = [screenshotObj backingImage];
+    if ([image isKindOfClass:[UIImage class]]) {
+        UIImage *shell = ShellImageIfNeeded(image);
+        if (shell && shell != image) {
+            [screenshotObj setBackingImage:shell];
+        }
+    }
+
+    objc_setAssociatedObject(screenshotObj, kShellBusyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 static id WrapImageBlock(id block) {
     if (!block) return nil;
     void (^origBlock)(id) = [block copy];
@@ -266,8 +291,12 @@ static id WrapImageBlock(id block) {
 
 %hook SSSScreenshot
 
-// 这里不要主动再套壳，避免太早写入导致后续编辑/保存链路重入
+// 首图就直接套壳，避免只在编辑/保存时才生效
 - (void)setBackingImage:(UIImage *)image {
+    if (isTweakEnabled() && [image isKindOfClass:[UIImage class]]) {
+        %orig(ShellImageIfNeeded(image));
+        return;
+    }
     %orig(image);
 }
 
@@ -279,6 +308,67 @@ static id WrapImageBlock(id block) {
 
     id wrapped = WrapImageBlock(block);
     %orig(transition, wrapped);
+}
+
+%end
+
+%hook SSSScreenshotView
+
+- (void)setScreenshot:(id)screenshot {
+    if (isTweakEnabled()) {
+        ApplyShellToScreenshotObject(screenshot);
+    }
+    %orig(screenshot);
+}
+
+%end
+
+%hook _SSSScreenshotImageView
+
+- (void)setScreenshot:(id)screenshot {
+    if (isTweakEnabled()) {
+        ApplyShellToScreenshotObject(screenshot);
+    }
+    %orig(screenshot);
+}
+
+- (void)imageViewDidLoadImage:(id)image {
+    if (isTweakEnabled() && [image isKindOfClass:[UIImage class]]) {
+        id screenshot = nil;
+        if ([self respondsToSelector:@selector(screenshot)]) {
+            screenshot = [self screenshot];
+        }
+        if (screenshot) {
+            ApplyShellToScreenshotObject(screenshot);
+        }
+    }
+    %orig(image);
+}
+
+- (void)_paperKitImageView:(id)view didFinishUpdatingImage:(id)image {
+    if (isTweakEnabled() && [image isKindOfClass:[UIImage class]]) {
+        id screenshot = nil;
+        if ([self respondsToSelector:@selector(screenshot)]) {
+            screenshot = [self screenshot];
+        }
+        if (screenshot) {
+            ApplyShellToScreenshotObject(screenshot);
+        }
+    }
+    %orig(view, image);
+}
+
+- (void)_paperKitImageView:(id)view willBeginUpdatingImage:(id)image {
+    if (isTweakEnabled() && [image isKindOfClass:[UIImage class]]) {
+        id screenshot = nil;
+        if ([self respondsToSelector:@selector(screenshot)]) {
+            screenshot = [self screenshot];
+        }
+        if (screenshot) {
+            ApplyShellToScreenshotObject(screenshot);
+        }
+    }
+    %orig(view, image);
 }
 
 %end
