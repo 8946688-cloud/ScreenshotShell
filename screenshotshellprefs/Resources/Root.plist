@@ -20,7 +20,7 @@
         <dict>
             <key>cell</key> <string>PSGroupCell</string>
             <key>label</key> <string>素材导入</string>
-            <key>footerText</key> <string>请分别导入透明手机壳图片和对应的配置文件。图片决定外观，配置决定位置。</string>
+            <key>footerText</key> <string>请导入透明手机壳图片 (shell.png) 和坐标配置文件 (config.cfg)。</string>
         </dict>
         <dict>
             <key>cell</key> <string>PSButtonCell</string>
@@ -34,10 +34,16 @@
             <key>action</key> <string>importConfigFile</string>
             <key>id</key> <string>cfgFileBtn</string>
         </dict>
-        
+
         <dict>
             <key>cell</key> <string>PSGroupCell</string>
-            <key>footerText</key> <string>Developed by iosdump</string>
+            <key>label</key> <string>高级工具</string>
+            <key>footerText</key> <string>自动保存套壳截图到相册已默认开启。</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSButtonCell</string>
+            <key>label</key> <string>📁 在 Filza 中打开配置目录</string>
+            <key>action</key> <string>openInFilza</string>
         </dict>
     </array>
     <key>title</key>
