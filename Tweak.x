@@ -236,8 +236,8 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rendered) return rawScreenshot;
 
     UIImage *finalImage = [UIImage imageWithCGImage:rendered.CGImage
-                                             scale:1.0
-                                       orientation:UIImageOrientationUp];
+                                              scale:1.0
+                                        orientation:UIImageOrientationUp];
     return finalImage ?: rendered ?: rawScreenshot;
 }
 
@@ -266,16 +266,9 @@ static id WrapImageBlock(id block) {
 
 %hook SSSScreenshot
 
-// 唯一修改的地方：在这里第一时间直接调用 ShellImageIfNeeded
-// 这样刚截图生成的原始数据立马被套上壳，左下角直接显示成功。
-// 同时由于你原本的 ImageAlreadyContainsShell 判断非常健壮，也不会导致后续链路壳中壳。
+// 这里不要主动再套壳，避免太早写入导致后续编辑/保存链路重入
 - (void)setBackingImage:(UIImage *)image {
-    if (!isTweakEnabled() || !image) {
-        %orig(image);
-        return;
-    }
-    UIImage *shelledImage = ShellImageIfNeeded(image);
-    %orig(shelledImage ?: image);
+    %orig(image);
 }
 
 - (void)requestImageInTransition:(_Bool)transition withBlock:(id)block {
@@ -290,7 +283,6 @@ static id WrapImageBlock(id block) {
 
 %end
 
-// Provider 下面的全部代码 100% 还原为你的初版，没有做任何多余修改！
 %hook SSSScreenshotImageProvider
 
 - (id)requestCGImageBackedUneditedImageForUIBlocking {
