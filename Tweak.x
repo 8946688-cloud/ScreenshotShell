@@ -9,6 +9,27 @@
 #endif
 
 // --------------------------------------------------------
+// 私有头文件声明
+// --------------------------------------------------------
+@interface SSEnvironmentDescription : NSObject
+- (void)setImageSurface:(id)surface;
+@end
+
+@interface SSSScreenshot : NSObject
+@property (retain, nonatomic) UIImage *backingImage;
+@property (readonly, nonatomic) SSEnvironmentDescription *environmentDescription;
+- (void)requestImageInTransition:(BOOL)transition withBlock:(id)block;
+@end
+
+@interface SSSScreenshotImageProvider : NSObject
+@property (nonatomic, weak) SSSScreenshot *screenshot;
+- (id)requestOutputImageForSavingBlocking;
+- (id)requestOutputImageForUIBlocking;
+- (void)requestOutputImageForSaving:(id)block;
+- (void)requestOutputImageForUI:(id)block;
+@end
+
+// --------------------------------------------------------
 // 路径与配置
 // --------------------------------------------------------
 static NSString *GetPrefDir(void) {
@@ -40,11 +61,30 @@ static BOOL isTweakEnabled(void) {
     return prefs ? [prefs[@"Enabled"] boolValue] : NO;
 }
 
+// 防重复套壳标记 (用于常规拦截)
+static const void *kShellAppliedKey = &kShellAppliedKey;
+
+static BOOL ImageAlreadyShelled(UIImage *image) {
+    if (!image) return NO;
+    NSNumber *flag = objc_getAssociatedObject(image, kShellAppliedKey);
+    return [flag boolValue];
+}
+
+static UIImage *MarkImageShelled(UIImage *image) {
+    if (image) {
+        objc_setAssociatedObject(image, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return image;
+}
+
 // --------------------------------------------------------
-// 核心：精准合成图像 + 终极防套娃逻辑
+// 核心：精准合成图像 + 终极特征防套娃
 // --------------------------------------------------------
 static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
+    
+    // 软拦截：检查关联对象
+    if (ImageAlreadyShelled(rawScreenshot)) return rawScreenshot;
 
     NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
     NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
@@ -58,18 +98,13 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     if (templateW <= 0 || templateH <= 0) return rawScreenshot;
 
     // ==========================================
-    // 终极杀招：物理尺寸防套娃 (彻底解决壳中壳)
+    // 终极杀招：物理特征防套娃 (彻底解决相册底层的壳中壳)
+    // 苹果原生的截图 scale 是 2.0 或 3.0，而我们合成的图强制为 1.0。
+    // 如果一张图的 scale 已经是 1.0，并且宽度等于模板宽度，说明100%是我们的图！
     // ==========================================
-    // 获取当前图片的真实像素尺寸 (不论 scale 是多少，像素点总数是不变的)
-    CGFloat pixelW = rawScreenshot.size.width * rawScreenshot.scale;
-    CGFloat pixelH = rawScreenshot.size.height * rawScreenshot.scale;
-    
-    // 如果图片的像素尺寸已经和模板的尺寸完全吻合（允许极其微小的浮点误差），
-    // 说明这张图之前已经走过套壳流程了，绝对不能再套第二次！直接返回！
-    if (fabs(pixelW - templateW) < 2.0 && fabs(pixelH - templateH) < 2.0) {
+    if (rawScreenshot.scale == 1.0 && fabs(rawScreenshot.size.width - templateW) < 1.0 && fabs(rawScreenshot.size.height - templateH) < 1.0) {
         return rawScreenshot;
     }
-    // ==========================================
 
     NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
     UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
@@ -86,14 +121,16 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 
     CGSize outSize = CGSizeMake(templateW, templateH);
 
-    // 强制使用比例 1.0 进行渲染，保证最终尺寸绝对服从 config.cfg
+    // 强制使用比例 1.0 进行渲染，彻底摆脱屏幕比例的干扰
     UIGraphicsBeginImageContextWithOptions(outSize, NO, 1.0);
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (ctx) {
         CGContextClearRect(ctx, CGRectMake(0, 0, outSize.width, outSize.height));
     }
 
+    // 1. 原图填洞
     [rawScreenshot drawInRect:CGRectMake(ltx, lty, holeW, holeH)];
+    // 2. 盖上外壳
     [shellImage drawInRect:CGRectMake(0, 0, outSize.width, outSize.height)];
 
     UIImage *rendered = UIGraphicsGetImageFromCurrentImageContext();
@@ -101,7 +138,11 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 
     if (!rendered) return rawScreenshot;
 
-    return [UIImage imageWithCGImage:rendered.CGImage scale:1.0 orientation:UIImageOrientationUp];
+    // 强制按 1.0 比例导出，尺寸永远是固定的 templateW/templateH
+    UIImage *finalImage = [UIImage imageWithCGImage:rendered.CGImage
+                                              scale:1.0
+                                        orientation:UIImageOrientationUp];
+    return MarkImageShelled(finalImage);
 }
 
 
@@ -110,8 +151,28 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 // --------------------------------------------------------
 %group ScreenshotCoreHook
 
-// 模型层拦截
+// --- 解决小窗口显示原图的问题 ---
 %hook SSSScreenshot
+
+// 拦截小窗口过渡动画，确保出现瞬间就是带壳的
+- (void)requestImageInTransition:(BOOL)transition withBlock:(id)block {
+    if (!block || !isTweakEnabled()) {
+        %orig(transition, block);
+        return;
+    }
+    void (^origBlock)(id) = [block copy];
+    void (^wrappedBlock)(id) = ^(id image) {
+        if ([image isKindOfClass:[UIImage class]]) {
+            UIImage *shelled = applyShellToScreenshot((UIImage *)image);
+            origBlock(shelled ?: image);
+        } else {
+            origBlock(image);
+        }
+    };
+    %orig(transition, wrappedBlock);
+}
+
+// 同步替换底层原图
 - (void)setBackingImage:(UIImage *)image {
     if (image && isTweakEnabled()) {
         UIImage *shelled = applyShellToScreenshot(image);
@@ -122,10 +183,21 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     }
     %orig(image);
 }
+
+- (UIImage *)backingImage {
+    UIImage *orig = %orig;
+    if (orig && isTweakEnabled()) {
+        return applyShellToScreenshot(orig) ?: orig;
+    }
+    return orig;
+}
+
 %end
 
-// 界面 UI 和 编辑流拦截
+
+// --- 解决编辑界面的数据提供器 ---
 %hook SSSScreenshotImageProvider
+
 - (id)requestOutputImageForUIBlocking {
     id image = %orig;
     if (!image || !isTweakEnabled()) return image;
@@ -177,7 +249,8 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 }
 %end
 
-// 相册保存最底层拦截 (负责解决“不编辑不存图”的问题)
+
+// --- 解决不编辑就无法保存的问题 (你完美的相册兜底方案) ---
 %hook PHAssetCreationRequest
 
 + (instancetype)creationRequestForAssetFromImage:(UIImage *)image {
@@ -253,6 +326,7 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     }
     %orig(type, fileURL, options);
 }
+
 %end
 
 %hook PHAssetChangeRequest
