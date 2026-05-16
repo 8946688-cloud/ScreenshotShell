@@ -46,7 +46,7 @@ static NSString * GetPlistPath() {
 }
 
 // --------------------------------------------------------
-// 核心：等比内缩算法 (完美解决编辑框错位)
+// 核心：基于 CFG 绝对像素的外壳渲染算法 (完美契合)
 // --------------------------------------------------------
 static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
@@ -54,6 +54,7 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     __block UIImage *finalImage = nil;
     
     @autoreleasepool {
+        // 1. 读取手机壳图片和配置
         NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
         UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
         if (!shellImage) return rawScreenshot; 
@@ -65,51 +66,51 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
         NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:kNilOptions error:nil];
         if (!cfg) return rawScreenshot;
         
-        // ⚠️ 重点：我们以原截图的尺寸作为画布基准，保证输出尺寸 100% 相同！
-        CGFloat rawW = rawScreenshot.size.width * rawScreenshot.scale;
-        CGFloat rawH = rawScreenshot.size.height * rawScreenshot.scale;
+        // 2. 从 CFG 读取外壳整体尺寸 (使用绝对像素)
+        CGFloat templateW = [cfg[@"template_width"] floatValue];
+        CGFloat templateH = [cfg[@"template_height"] floatValue];
         
-        CGFloat shellW = shellImage.size.width;
-        CGFloat shellH = shellImage.size.height;
+        // 容错处理：如果 cfg 没写宽高，降级使用图片的真实像素大小
+        if (templateW <= 0 || templateH <= 0) {
+            templateW = shellImage.size.width * shellImage.scale;
+            templateH = shellImage.size.height * shellImage.scale;
+        }
         
-        // 计算外壳为了塞进屏幕需要缩小的比例 (Aspect Fit)
-        CGFloat scaleX = rawW / shellW;
-        CGFloat scaleY = rawH / shellH;
-        CGFloat shellScale = MIN(scaleX, scaleY);
+        // 3. 从 CFG 读取内部透明窟窿的坐标
+        CGFloat ltx = [cfg[@"left_top_x"] floatValue];
+        CGFloat lty = [cfg[@"left_top_y"] floatValue];
+        CGFloat rtx = [cfg[@"right_top_x"] floatValue];
+        CGFloat lby = [cfg[@"left_bottom_y"] floatValue];
         
-        // 计算外壳在画布中的最终尺寸和居中位置
-        CGFloat finalShellW = shellW * shellScale;
-        CGFloat finalShellH = shellH * shellScale;
-        CGFloat shellX = (rawW - finalShellW) / 2.0;
-        CGFloat shellY = (rawH - finalShellH) / 2.0;
-        
-        // 计算截图在画布中的位置 (基于 cfg 坐标)
-        CGFloat ltx = [cfg[@"left_top_x"] floatValue] * shellScale;
-        CGFloat lty = [cfg[@"left_top_y"] floatValue] * shellScale;
-        CGFloat rtx = [cfg[@"right_top_x"] floatValue] * shellScale;
-        CGFloat lby = [cfg[@"left_bottom_y"] floatValue] * shellScale;
-        
-        CGFloat innerX = shellX + ltx;
-        CGFloat innerY = shellY + lty;
+        // 计算内部窟窿的真实宽度和高度
         CGFloat innerW = rtx - ltx;
         CGFloat innerH = lby - lty;
         
-        // 开始渲染 (强制 1.0 比例防内存溢出)
+        // 防止除数为0或配置异常
+        if (innerW <= 0 || innerH <= 0) return rawScreenshot;
+        
+        // 4. 开始渲染画布
         if (@available(iOS 10.0, *)) {
             UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
-            format.scale = 1.0; 
-            format.opaque = NO; 
+            // ⚠️ 极其关键：强制 Scale 为 1.0，这意味着我们完全按照 1:1 的真实像素(1像素=1点)来画，防止被系统的 @3x 机制扰乱坐标！
+            format.scale = 1.0;  
+            format.opaque = NO;  // 允许透明层
             
-            UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(rawW, rawH) format:format];
+            // 以外壳的总像素大小作为大画布
+            UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(templateW, templateH) format:format];
             
             UIImage *renderedImage = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull context) {
-                // 底层：画出截图（它会被等比缩小塞进透明窟窿里）
-                [rawScreenshot drawInRect:CGRectMake(innerX, innerY, innerW, innerH)];
-                // 顶层：盖上手机壳（它天然的镂空透明层会遮住多余的边缘）
-                [shellImage drawInRect:CGRectMake(shellX, shellY, finalShellW, finalShellH)];
+                
+                // 第一步（底层）：把系统的原截图，强行塞进 CFG 规定的“窟窿”坐标里
+                [rawScreenshot drawInRect:CGRectMake(ltx, lty, innerW, innerH)];
+                
+                // 第二步（顶层）：把手机壳盖在最上面（从 0,0 开始铺满画布），透明区域自然会漏出下面的原图
+                [shellImage drawInRect:CGRectMake(0, 0, templateW, templateH)];
+                
             }];
             
-            // 重新赋予原始 Scale，骗过系统 UI
+            // 5. 重新赋予原始截屏的 Scale (例如 @3x) 
+            // 这样系统保存相册和显示时，依然会认为这是一张超高清的 Retina 图片，不会变模糊。
             finalImage = [UIImage imageWithCGImage:renderedImage.CGImage scale:rawScreenshot.scale orientation:rawScreenshot.imageOrientation];
         }
     }
@@ -122,7 +123,7 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
 // --------------------------------------------------------
 %group ScreenshotCoreHook
 
-// 1. 替换 UI 显示（因为尺寸一模一样，编辑框完美工作）
+// 1. 替换 UI 显示（因为尺寸变了，所以重置系统编辑框约束）
 %hook SSSScreenshot
 - (void)setBackingImage:(UIImage *)image {
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
