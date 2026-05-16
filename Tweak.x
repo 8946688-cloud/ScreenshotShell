@@ -48,7 +48,7 @@ static NSString * GetPlistPath() {
 }
 
 // --------------------------------------------------------
-// 核心：基于四角坐标与四舍五入的完美透明渲染算法
+// 核心：基于取整与直接输出的完美透明渲染算法
 // --------------------------------------------------------
 static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
@@ -75,14 +75,11 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     CGFloat templateW = [cfg[@"template_width"] doubleValue];
     CGFloat templateH = [cfg[@"template_height"] doubleValue];
 
+    // 仅提取我们需要用到的四个有效坐标，避免出现 unused variable 编译错误
     CGFloat ltx = [cfg[@"left_top_x"] doubleValue];
     CGFloat lty = [cfg[@"left_top_y"] doubleValue];
     CGFloat rtx = [cfg[@"right_top_x"] doubleValue];
-    CGFloat rty = [cfg[@"right_top_y"] doubleValue];
-    CGFloat lbx = [cfg[@"left_bottom_x"] doubleValue];
     CGFloat lby = [cfg[@"left_bottom_y"] doubleValue];
-    CGFloat rbx = [cfg[@"right_bottom_x"] doubleValue];
-    CGFloat rby = [cfg[@"right_bottom_y"] doubleValue];
 
     // 计算内部洞的实际宽和高
     CGFloat holeW = rtx - ltx;
