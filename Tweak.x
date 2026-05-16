@@ -42,6 +42,12 @@
 - (void)setScreenshot:(id)screenshot;
 @end
 
+@interface _SSSScreenshotImageView : UIView
+- (id)screenshot;
+- (void)setScreenshot:(id)screenshot;
+- (void)generateSnapshotImageIfNecessary:(_Bool)necessary withCompletion:(id /* block */)completion;
+@end
+
 // --------------------------------------------------------
 // 路径与配置
 // --------------------------------------------------------
@@ -367,6 +373,25 @@ static void EnsureScreenshotCachedShell(id screenshotObj) {
         EnsureScreenshotCachedShell(screenshot);
     }
     %orig(screenshot);
+}
+
+%end
+
+%hook _SSSScreenshotImageView
+
+- (void)generateSnapshotImageIfNecessary:(_Bool)necessary withCompletion:(id)completion {
+    if (!completion || !isTweakEnabled()) {
+        %orig(necessary, completion);
+        return;
+    }
+
+    SSSScreenshot *shot = nil;
+    if ([self respondsToSelector:@selector(screenshot)]) {
+        shot = [self screenshot];
+    }
+
+    id wrapped = WrapImageBlockForScreenshot(shot, completion);
+    %orig(necessary, wrapped);
 }
 
 %end
