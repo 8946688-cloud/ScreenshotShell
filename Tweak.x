@@ -16,6 +16,10 @@
 @class SSSScreenshotView;
 @class _SSSScreenshotImageView;
 
+@interface _SSSScreenshotImageView : UIView
+- (id)screenshot;
+@end
+
 @interface SSSScreenshot : NSObject
 - (void)setBackingImage:(UIImage *)image;
 - (UIImage *)backingImage;
