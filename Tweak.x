@@ -1,5 +1,4 @@
 #import <UIKit/UIKit.h>
-#import <Photos/Photos.h>
 #import <objc/runtime.h>
 
 #if __has_include(<roothide.h>)
@@ -55,25 +54,22 @@ static BOOL isTweakEnabled(void) {
 }
 
 // --------------------------------------------------------
-// 防重复套壳
+// 用 screenshot 对象本身存“原图”，避免 UIImage 重建后标记丢失
 // --------------------------------------------------------
-static const void *kShellAppliedKey = &kShellAppliedKey;
+static const void *kRawImageKey = &kRawImageKey;
 
-static BOOL ImageAlreadyShelled(UIImage *image) {
-    if (!image) return NO;
-    NSNumber *flag = objc_getAssociatedObject(image, kShellAppliedKey);
-    return [flag boolValue];
+static UIImage *GetRawImage(id screenshot) {
+    return objc_getAssociatedObject(screenshot, kRawImageKey);
 }
 
-static UIImage *MarkImageShelled(UIImage *image) {
-    if (image) {
-        objc_setAssociatedObject(image, kShellAppliedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+static void SetRawImage(id screenshot, UIImage *image) {
+    if (screenshot) {
+        objc_setAssociatedObject(screenshot, kRawImageKey, image, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    return image;
 }
 
 // --------------------------------------------------------
-// 读取 shell / cfg
+// 读取壳图 / cfg
 // --------------------------------------------------------
 static UIImage *LoadShellImage(void) {
     NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
@@ -91,13 +87,12 @@ static NSDictionary *LoadConfig(void) {
 }
 
 // --------------------------------------------------------
-// 核心：按 cfg 把截图放进壳里
-// 重点：最终输出尺寸固定用 template_width/template_height
-// 壳不跟着截图编辑动作变化
+// 核心：只套一次壳
+// - 原图永远不变
+// - 输出图才套壳
 // --------------------------------------------------------
-static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
+static UIImage *ApplyShellToRawImage(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
-    if (ImageAlreadyShelled(rawScreenshot)) return rawScreenshot;
 
     UIImage *shellImage = LoadShellImage();
     if (!shellImage) return rawScreenshot;
@@ -126,10 +121,10 @@ static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
         CGContextClearRect(ctx, CGRectMake(0, 0, outSize.width, outSize.height));
     }
 
-    // 先把原截图铺到洞里
+    // 先把原截图放进洞里
     [rawScreenshot drawInRect:CGRectMake(ltx, lty, holeW, holeH)];
 
-    // 再把壳盖上去，壳尺寸永远固定为 template 尺寸
+    // 再盖壳，壳尺寸固定
     [shellImage drawInRect:CGRectMake(0, 0, outSize.width, outSize.height)];
 
     UIImage *rendered = UIGraphicsGetImageFromCurrentImageContext();
@@ -140,7 +135,7 @@ static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
     UIImage *finalImage = [UIImage imageWithCGImage:rendered.CGImage
                                                scale:1.0
                                          orientation:UIImageOrientationUp];
-    return MarkImageShelled(finalImage);
+    return finalImage ?: rawScreenshot;
 }
 
 // --------------------------------------------------------
@@ -148,29 +143,39 @@ static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
 // --------------------------------------------------------
 %group ScreenshotCoreHook
 
-// 1) 输出图路径之一：请求给 UI / 保存的图
 %hook SSSScreenshot
 
-- (UIImage *)backingImage {
-    UIImage *img = %orig;
-    if (!img || !isTweakEnabled()) return img;
-
-    UIImage *shelled = ApplyShellToScreenshot(img);
-    return shelled ?: img;
+// 只保存原图，不在这里套壳
+- (void)setBackingImage:(UIImage *)image {
+    if (image && isTweakEnabled()) {
+        SetRawImage(self, image);
+    }
+    %orig(image);
 }
 
-// 2) 这条通常是关键输出链路：不要改模型，只包 block 的输出
+// 输出给 UI / 保存的关键点：这里再套壳
 - (void)requestImageInTransition:(BOOL)transition withBlock:(id)block {
     if (!block || !isTweakEnabled()) {
         %orig(transition, block);
         return;
     }
 
+    UIImage *raw = GetRawImage(self);
+
     void (^origBlock)(id) = [block copy];
     void (^wrappedBlock)(id) = ^(id image) {
-        if ([image isKindOfClass:[UIImage class]]) {
-            UIImage *shelled = ApplyShellToScreenshot((UIImage *)image);
-            origBlock(shelled ?: image);
+        UIImage *source = nil;
+
+        // 优先用我们保存的原图，避免对已经套过壳的图再次加工
+        if (raw && [raw isKindOfClass:[UIImage class]]) {
+            source = raw;
+        } else if ([image isKindOfClass:[UIImage class]]) {
+            source = (UIImage *)image;
+        }
+
+        if (source) {
+            UIImage *shelled = ApplyShellToRawImage(source);
+            origBlock(shelled ?: source);
         } else {
             origBlock(image);
         }
@@ -179,15 +184,18 @@ static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
     %orig(transition, wrappedBlock);
 }
 
-// 3) 很多保存流程会走这个，直接返回带壳的图片数据
+// 保存数据的地方也套壳
 - (NSData *)imageModificationData {
     NSData *data = %orig;
     if (!data || !isTweakEnabled()) return data;
 
-    UIImage *img = [UIImage imageWithData:data];
-    if (!img) return data;
+    UIImage *raw = GetRawImage(self);
+    if (!raw) {
+        raw = [UIImage imageWithData:data];
+    }
+    if (!raw) return data;
 
-    UIImage *shelled = ApplyShellToScreenshot(img);
+    UIImage *shelled = ApplyShellToRawImage(raw);
     if (!shelled) return data;
 
     NSData *png = UIImagePNGRepresentation(shelled);
