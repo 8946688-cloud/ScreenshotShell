@@ -40,7 +40,6 @@
 @interface _SSSScreenshotImageView : UIView
 - (id)screenshot;
 - (void)setScreenshot:(id)screenshot;
-- (void)generateSnapshotImageIfNecessary:(_Bool)necessary withCompletion:(id /* block */)completion;
 @end
 
 // --------------------------------------------------------
@@ -79,7 +78,6 @@ static BOOL isTweakEnabled(void) {
 // 关联对象 key
 // --------------------------------------------------------
 static const void *kShellImageKey = &kShellImageKey;
-static const void *kShellBusyKey = &kShellBusyKey;
 
 // --------------------------------------------------------
 // 像素采样工具
@@ -296,29 +294,6 @@ static id WrapImageBlockForScreenshot(SSSScreenshot *screenshot, id block) {
     return [wrappedBlock copy];
 }
 
-static void EnsureScreenshotCachedShell(id screenshotObj) {
-    if (!screenshotObj || !isTweakEnabled()) return;
-    if (![screenshotObj respondsToSelector:@selector(backingImage)] ||
-        ![screenshotObj respondsToSelector:@selector(setBackingImage:)]) {
-        return;
-    }
-
-    NSNumber *busy = objc_getAssociatedObject(screenshotObj, kShellBusyKey);
-    if (busy.boolValue) return;
-
-    objc_setAssociatedObject(screenshotObj, kShellBusyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    UIImage *image = [screenshotObj backingImage];
-    if ([image isKindOfClass:[UIImage class]]) {
-        UIImage *shell = ShellImageForScreenshot(screenshotObj, image);
-        if (shell && shell != image) {
-            [screenshotObj setBackingImage:shell];
-        }
-    }
-
-    objc_setAssociatedObject(screenshotObj, kShellBusyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
 // --------------------------------------------------------
 // Hook 注入
 // --------------------------------------------------------
@@ -364,17 +339,42 @@ static void EnsureScreenshotCachedShell(id screenshotObj) {
 
 %end
 
+%hook SSSScreenshotView
+
+- (void)setScreenshot:(id)screenshot {
+    if (isTweakEnabled()) {
+        UIImage *cached = nil;
+        if ([screenshot respondsToSelector:@selector(backingImage)]) {
+            cached = [screenshot backingImage];
+        }
+        if ([cached isKindOfClass:[UIImage class]]) {
+            UIImage *shell = ShellImageForScreenshot(screenshot, cached);
+            if (shell && [screenshot respondsToSelector:@selector(setBackingImage:)]) {
+                [screenshot setBackingImage:shell];
+            }
+        }
+    }
+    %orig(screenshot);
+}
+
+%end
+
 %hook _SSSScreenshotImageView
 
-- (void)generateSnapshotImageIfNecessary:(_Bool)necessary withCompletion:(id)completion {
+- (void)setScreenshot:(id)screenshot {
     if (isTweakEnabled()) {
-        id shot = nil;
-        if ([self respondsToSelector:@selector(screenshot)]) {
-            shot = [self screenshot];
+        UIImage *cached = nil;
+        if ([screenshot respondsToSelector:@selector(backingImage)]) {
+            cached = [screenshot backingImage];
         }
-        EnsureScreenshotCachedShell(shot);
+        if ([cached isKindOfClass:[UIImage class]]) {
+            UIImage *shell = ShellImageForScreenshot(screenshot, cached);
+            if (shell && [screenshot respondsToSelector:@selector(setBackingImage:)]) {
+                [screenshot setBackingImage:shell];
+            }
+        }
     }
-    %orig(necessary, completion);
+    %orig(screenshot);
 }
 
 %end
