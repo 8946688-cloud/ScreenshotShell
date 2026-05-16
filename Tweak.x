@@ -37,11 +37,6 @@
 - (void)requestOutputImageInTransition:(_Bool)transition forSaving:(id /* block */)block;
 @end
 
-@interface SSSScreenshotView : UIView
-- (id)screenshot;
-- (void)setScreenshot:(id)screenshot;
-@end
-
 @interface _SSSScreenshotImageView : UIView
 - (id)screenshot;
 - (void)setScreenshot:(id)screenshot;
@@ -247,7 +242,10 @@ static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
 
 static UIImage *ShellImageForScreenshot(SSSScreenshot *screenshot, UIImage *image) {
     if (!image) return nil;
-    if (!isTweakEnabled()) return image;
+
+    if (!isTweakEnabled()) {
+        return image;
+    }
 
     if (screenshot) {
         UIImage *cached = objc_getAssociatedObject(screenshot, kShellImageKey);
@@ -366,32 +364,17 @@ static void EnsureScreenshotCachedShell(id screenshotObj) {
 
 %end
 
-%hook SSSScreenshotView
-
-- (void)setScreenshot:(id)screenshot {
-    if (isTweakEnabled()) {
-        EnsureScreenshotCachedShell(screenshot);
-    }
-    %orig(screenshot);
-}
-
-%end
-
 %hook _SSSScreenshotImageView
 
 - (void)generateSnapshotImageIfNecessary:(_Bool)necessary withCompletion:(id)completion {
-    if (!completion || !isTweakEnabled()) {
-        %orig(necessary, completion);
-        return;
+    if (isTweakEnabled()) {
+        id shot = nil;
+        if ([self respondsToSelector:@selector(screenshot)]) {
+            shot = [self screenshot];
+        }
+        EnsureScreenshotCachedShell(shot);
     }
-
-    SSSScreenshot *shot = nil;
-    if ([self respondsToSelector:@selector(screenshot)]) {
-        shot = [self screenshot];
-    }
-
-    id wrapped = WrapImageBlockForScreenshot(shot, completion);
-    %orig(necessary, wrapped);
+    %orig(necessary, completion);
 }
 
 %end
