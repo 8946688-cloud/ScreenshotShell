@@ -19,59 +19,28 @@
         
         <dict>
             <key>cell</key> <string>PSGroupCell</string>
-            <key>label</key> <string>外壳素材</string>
-            <key>footerText</key> <string>请选择一张中间透明的手机壳PNG图片</string>
+            <key>label</key> <string>素材导入</string>
+            <key>footerText</key> <string>请分别导入透明手机壳图片和对应的配置文件。图片决定外观，配置决定位置。</string>
         </dict>
         <dict>
             <key>cell</key> <string>PSButtonCell</string>
-            <key>label</key> <string>选择外壳图片</string>
+            <key>label</key> <string>1. 导入外壳图片 (.png)</string>
             <key>action</key> <string>chooseShellImage</string>
             <key>id</key> <string>shellImageBtn</string>
         </dict>
-
+        <dict>
+            <key>cell</key> <string>PSButtonCell</string>
+            <key>label</key> <string>2. 导入配置文件 (.cfg)</string>
+            <key>action</key> <string>importConfigFile</string>
+            <key>id</key> <string>cfgFileBtn</string>
+        </dict>
+        
         <dict>
             <key>cell</key> <string>PSGroupCell</string>
-            <key>label</key> <string>截图内嵌坐标与尺寸 (px)</string>
-            <key>footerText</key> <string>设定原始截图应该画在外壳图片的哪个位置和大小。</string>
-        </dict>
-        <dict>
-            <key>cell</key> <string>PSEditTextCell</string>
-            <key>default</key> <string>50</string>
-            <key>defaults</key> <string>com.iosdump.screenshotshell</string>
-            <key>key</key> <string>RectX</string>
-            <key>label</key> <string>X 坐标</string>
-            <key>keyboard</key> <string>phone</string>
-            <key>PostNotification</key> <string>com.iosdump.screenshotshell/ReloadPrefs</string>
-        </dict>
-        <dict>
-            <key>cell</key> <string>PSEditTextCell</string>
-            <key>default</key> <string>50</string>
-            <key>defaults</key> <string>com.iosdump.screenshotshell</string>
-            <key>key</key> <string>RectY</string>
-            <key>label</key> <string>Y 坐标</string>
-            <key>keyboard</key> <string>phone</string>
-            <key>PostNotification</key> <string>com.iosdump.screenshotshell/ReloadPrefs</string>
-        </dict>
-        <dict>
-            <key>cell</key> <string>PSEditTextCell</string>
-            <key>default</key> <string>1170</string>
-            <key>defaults</key> <string>com.iosdump.screenshotshell</string>
-            <key>key</key> <string>RectW</string>
-            <key>label</key> <string>宽度 (Width)</string>
-            <key>keyboard</key> <string>phone</string>
-            <key>PostNotification</key> <string>com.iosdump.screenshotshell/ReloadPrefs</string>
-        </dict>
-        <dict>
-            <key>cell</key> <string>PSEditTextCell</string>
-            <key>default</key> <string>2532</string>
-            <key>defaults</key> <string>com.iosdump.screenshotshell</string>
-            <key>key</key> <string>RectH</string>
-            <key>label</key> <string>高度 (Height)</string>
-            <key>keyboard</key> <string>phone</string>
-            <key>PostNotification</key> <string>com.iosdump.screenshotshell/ReloadPrefs</string>
+            <key>footerText</key> <string>Developed by iosdump</string>
         </dict>
     </array>
     <key>title</key>
-    <string>截图套壳</string>
+    <string>截图自动套壳</string>
 </dict>
 </plist>
