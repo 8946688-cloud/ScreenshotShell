@@ -8,6 +8,7 @@
 #define jbroot(path) path
 #endif
 
+// 完全使用原有的路径逻辑
 static NSString * GetPrefDir() {
     NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.screenshotshell.media";
 #if __has_include(<roothide.h>)
@@ -43,7 +44,22 @@ static NSString * GetPrefDir() {
     return _specifiers;
 }
 
-// ========== 1. 导入图片逻辑 ==========
+// ========== 跳转 Filza 功能 ==========
+- (void)openInFilza {
+    NSString *dir = GetPrefDir();
+    NSString *filzaUrlStr = [NSString stringWithFormat:@"filza://workspace%@", dir];
+    NSURL *url = [NSURL URLWithString:[filzaUrlStr stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+    
+    if ([[UIApplication sharedApplication] canOpenURL:url]) {
+        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+    } else {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"未找到 Filza" message:@"请先在越狱商店安装 Filza File Manager。" preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+    }
+}
+
+// ========== 导入图片 ==========
 - (void)chooseShellImage {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (@available(iOS 14.0, *)) {
@@ -81,11 +97,10 @@ static NSString * GetPrefDir() {
     }
 }
 
-// ========== 2. 导入 CFG 逻辑 ==========
+// ========== 导入 CFG ==========
 - (void)importConfigFile {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (@available(iOS 14.0, *)) {
-            // 允许选择所有类型的文件（因为 .cfg 是自定义后缀，用泛型即可）
             UIDocumentPickerViewController *docPicker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem]];
             docPicker.delegate = self;
             docPicker.allowsMultipleSelection = NO;
@@ -102,10 +117,9 @@ static NSString * GetPrefDir() {
     NSURL *sourceURL = urls.firstObject;
     if (!sourceURL) return;
     
-    // 获取安全访问权限
     BOOL accessing = [sourceURL startAccessingSecurityScopedResource];
-    
     NSFileManager *fm = [NSFileManager defaultManager];
+    
     if ([fm fileExistsAtPath:SHELL_CFG_PATH]) {
         [fm removeItemAtPath:SHELL_CFG_PATH error:nil];
     }
@@ -125,13 +139,12 @@ static NSString * GetPrefDir() {
     });
 }
 
-// ========== UI 反馈逻辑 ==========
+// ========== UI 反馈 ==========
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
     PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];
     NSFileManager *fm = [NSFileManager defaultManager];
     
-    // 图片导入状态反馈
     if ([specifier.identifier isEqualToString:@"shellImageBtn"]) {
         if ([fm fileExistsAtPath:SHELL_IMG_PATH]) {
             UIImage *savedImage = [UIImage imageWithContentsOfFile:SHELL_IMG_PATH];
@@ -143,8 +156,6 @@ static NSString * GetPrefDir() {
             cell.accessoryView = nil;
         }
     }
-    
-    // 配置文件导入状态反馈
     if ([specifier.identifier isEqualToString:@"cfgFileBtn"]) {
         if ([fm fileExistsAtPath:SHELL_CFG_PATH]) {
             UILabel *statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 60, 30)];
@@ -157,7 +168,6 @@ static NSString * GetPrefDir() {
             cell.accessoryView = nil;
         }
     }
-    
     return cell;
 }
 @end
