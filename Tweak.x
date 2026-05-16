@@ -79,11 +79,6 @@ static BOOL HostShellApplied(id host) {
     return [objc_getAssociatedObject(host, kShellAppliedKey) boolValue];
 }
 
-static void SetHostShellApplied(id host, BOOL applied) {
-    if (!host) return;
-    objc_setAssociatedObject(host, kShellAppliedKey, @(applied), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
 static BOOL HostShellBusy(id host) {
     if (!host) return NO;
     return [objc_getAssociatedObject(host, kShellBusyKey) boolValue];
@@ -112,7 +107,6 @@ static void SetHostShelledImage(id host, UIImage *image) {
 static UIImage *applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
 
-    // 如果这个 UIImage 自己已经被标记过，直接返回，避免同一对象重复处理
     if ([objc_getAssociatedObject(rawScreenshot, kShellAppliedKey) boolValue]) {
         return rawScreenshot;
     }
@@ -177,13 +171,11 @@ static UIImage *ShellImageForHost(id host, UIImage *image) {
     if (!image) return nil;
     if (!isTweakEnabled()) return image;
 
-    // 已经套过壳：优先复用 host 缓存
     if (HostShellApplied(host)) {
         UIImage *cached = HostShelledImage(host);
         if (cached) return cached;
     }
 
-    // 防重入
     if (HostShellBusy(host)) {
         return image;
     }
@@ -226,7 +218,6 @@ static id WrapImageBlockWithHost(id host, id block) {
         return;
     }
 
-    // 先看这张截图是否已经有最终壳图缓存
     UIImage *cached = HostShelledImage(self);
     if (cached) {
         %orig(cached);
