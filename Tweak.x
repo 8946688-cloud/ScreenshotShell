@@ -36,27 +36,55 @@ static NSString * GetPlistPath() {
 static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
     
-    // 1. 读取配置
+    // 1. 读取总开关配置
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
     if (!prefs || ![prefs[@"Enabled"] boolValue]) {
-        return rawScreenshot; // 未开启
+        return rawScreenshot;
     }
     
     // 2. 读取外壳图片
     NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
     UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
     if (!shellImage) {
-        return rawScreenshot; // 没有外壳图片
+        return rawScreenshot;
     }
     
-    // 3. 读取坐标
-    CGFloat rx = [prefs[@"RectX"] floatValue];
-    CGFloat ry = [prefs[@"RectY"] floatValue];
-    CGFloat rw = [prefs[@"RectW"] floatValue];
-    CGFloat rh = [prefs[@"RectH"] floatValue];
-    CGRect innerRect = CGRectMake(rx, ry, rw, rh);
+    // 3. 读取配置文件 (JSON格式)
+    NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
+    NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
+    if (!cfgData) {
+        return rawScreenshot;
+    }
     
-    // 4. 开始合成
+    NSError *error;
+    NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:kNilOptions error:&error];
+    if (!cfg || error) {
+        return rawScreenshot;
+    }
+    
+    // 4. 解析坐标
+    CGFloat leftTopX = [cfg[@"left_top_x"] floatValue];
+    CGFloat leftTopY = [cfg[@"left_top_y"] floatValue];
+    CGFloat rightTopX = [cfg[@"right_top_x"] floatValue];
+    CGFloat leftBottomY = [cfg[@"left_bottom_y"] floatValue];
+    
+    CGFloat rawW = rightTopX - leftTopX;
+    CGFloat rawH = leftBottomY - leftTopY;
+    
+    // 5. 动态比例换算 (适配外壳图片的实际分辨率)
+    CGFloat templateW = [cfg[@"template_width"] floatValue];
+    CGFloat templateH = [cfg[@"template_height"] floatValue];
+    
+    CGFloat scaleX = (templateW > 0) ? (shellImage.size.width / templateW) : 1.0;
+    CGFloat scaleY = (templateH > 0) ? (shellImage.size.height / templateH) : 1.0;
+    
+    // 最终截图需要绘制的内部区域
+    CGRect innerRect = CGRectMake(leftTopX * scaleX, 
+                                  leftTopY * scaleY, 
+                                  rawW * scaleX, 
+                                  rawH * scaleY);
+    
+    // 6. 开始合成
     UIGraphicsBeginImageContextWithOptions(shellImage.size, NO, 0.0);
     
     // 底层画原始截图
@@ -83,10 +111,9 @@ static void saveRawScreenshotToPhotos(UIImage *rawImage) {
 }
 
 // ============================================
-// Hook ScreenshotServicesService (控制悬浮窗及保存)
+// Hook ScreenshotServicesService
 // ============================================
 %group ScreenshotServiceHook
-
 %hook SSSScreenshot
 - (void)setBackingImage:(UIImage *)image {
     if (image) {
@@ -98,14 +125,12 @@ static void saveRawScreenshotToPhotos(UIImage *rawImage) {
     }
 }
 %end
-
-%end // ScreenshotServiceHook
+%end
 
 // ============================================
-// Hook SpringBoard (保险：某些版本在发往服务前就设置了)
+// Hook SpringBoard
 // ============================================
 %group SpringBoardHook
-
 %hook SSUIShowScreenshotUIWithImageServiceRequest
 - (void)setImage:(UIImage *)image {
     if (image) {
@@ -117,8 +142,7 @@ static void saveRawScreenshotToPhotos(UIImage *rawImage) {
     }
 }
 %end
-
-%end // SpringBoardHook
+%end
 
 // ============================================
 // 构造入口，分配进程
