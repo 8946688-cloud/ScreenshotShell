@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Photos/Photos.h>
+#import <CoreImage/CoreImage.h> // 必须引入透视形变框架
 
 #if __has_include(<roothide.h>)
 #import <roothide.h>
@@ -8,7 +9,7 @@
 #endif
 
 // --------------------------------------------------------
-// 声明私有头文件
+// 声明私有头文件 (粉碎截图缓存的必要组件)
 // --------------------------------------------------------
 @interface SSEnvironmentDescription : NSObject
 @property (nonatomic) CGSize imagePixelSize;
@@ -22,7 +23,7 @@
 @end
 
 // --------------------------------------------------------
-// 路径辅助与配置
+// 路径辅助
 // --------------------------------------------------------
 static NSString * GetPrefDir() {
     NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.screenshotshell.media";
@@ -49,14 +50,14 @@ static NSString * GetPlistPath() {
 }
 
 // --------------------------------------------------------
-// 核心：合成套壳图 (防 OOM 内存爆炸版 + 像素级精准映射)
+// 核心：基于 4 个顶点进行 3D 透视形变并合成
 // --------------------------------------------------------
 static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
     
     __block UIImage *finalImage = nil;
     
-    // ⚠️ 核心优化 1：使用自动释放池，图片一旦处理完，瞬间清空几十MB内存，防止设备卡顿被杀！
+    // 开启内存释放池，防止处理 3000x5000 级大图时引发 SpringBoard OOM 崩溃被杀
     @autoreleasepool {
         NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
         UIImage *shellImage = [UIImage imageWithContentsOfFile:shellPath];
@@ -69,39 +70,69 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
         NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:kNilOptions error:nil];
         if (!cfg) return rawScreenshot;
         
-        CGFloat leftTopX = [cfg[@"left_top_x"] floatValue];
-        CGFloat leftTopY = [cfg[@"left_top_y"] floatValue];
-        CGFloat rightTopX = [cfg[@"right_top_x"] floatValue];
-        CGFloat leftBottomY = [cfg[@"left_bottom_y"] floatValue];
-        
-        CGFloat rawW = rightTopX - leftTopX;
-        CGFloat rawH = leftBottomY - leftTopY;
         CGFloat templateW = [cfg[@"template_width"] floatValue];
         CGFloat templateH = [cfg[@"template_height"] floatValue];
+        if (templateW <= 0 || templateH <= 0) return rawScreenshot;
         
-        // ⚠️ 核心优化 2：强制读取底层 CGImage 的真实像素大小，无视苹果的 @2x/@3x 机制！
-        // 这样计算出的比例和坐标才是 100% 吻合 CFG 文件的。
-        CGFloat pixelW = CGImageGetWidth(shellImage.CGImage);
-        CGFloat pixelH = CGImageGetHeight(shellImage.CGImage);
+        CGFloat pixelW = shellImage.size.width;
+        CGFloat pixelH = shellImage.size.height;
         
-        CGFloat scaleX = (templateW > 0) ? (pixelW / templateW) : 1.0;
-        CGFloat scaleY = (templateH > 0) ? (pixelH / templateH) : 1.0;
+        // 【防重复套壳】防止 Hook 被多次触发导致画中画
+        if (CGSizeEqualToSize(rawScreenshot.size, CGSizeMake(pixelW, pixelH)) || 
+            CGSizeEqualToSize(rawScreenshot.size, CGSizeMake(templateW, templateH))) {
+            return rawScreenshot;
+        }
         
-        CGRect innerRect = CGRectMake(leftTopX * scaleX, leftTopY * scaleY, rawW * scaleX, rawH * scaleY);
+        CGFloat scaleX = pixelW / templateW;
+        CGFloat scaleY = pixelH / templateH;
         
-        // ⚠️ 核心优化 3：使用现代的 Renderer API
+        // 严格提取 CFG 中的 4 个顶点坐标，并进行比例换算
+        CGFloat ltx = [cfg[@"left_top_x"] floatValue] * scaleX;
+        CGFloat lty = [cfg[@"left_top_y"] floatValue] * scaleY;
+        CGFloat rtx = [cfg[@"right_top_x"] floatValue] * scaleX;
+        CGFloat rty = [cfg[@"right_top_y"] floatValue] * scaleY;
+        CGFloat lbx = [cfg[@"left_bottom_x"] floatValue] * scaleX;
+        CGFloat lby = [cfg[@"left_bottom_y"] floatValue] * scaleY;
+        CGFloat rbx = [cfg[@"right_bottom_x"] floatValue] * scaleX;
+        CGFloat rby = [cfg[@"right_bottom_y"] floatValue] * scaleY;
+        
+        // 1. 将截图标准化 (消除屏幕旋转可能带来的干扰)
+        UIGraphicsBeginImageContextWithOptions(rawScreenshot.size, NO, rawScreenshot.scale);
+        [rawScreenshot drawAtPoint:CGPointZero];
+        UIImage *normalizedScreenshot = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        
+        // 2. 动用底层滤镜：CIPerspectiveTransform 透视形变
+        CIImage *ciScreenshot = [[CIImage alloc] initWithImage:normalizedScreenshot];
+        CIFilter *perspectiveFilter = [CIFilter filterWithName:@"CIPerspectiveTransform"];
+        [perspectiveFilter setValue:ciScreenshot forKey:kCIInputImageKey];
+        
+        // 注意：CoreImage 坐标系的原点在【左下角】，需要将 Y 轴反转映射
+        [perspectiveFilter setValue:[CIVector vectorWithX:ltx Y:pixelH - lty] forKey:@"inputTopLeft"];
+        [perspectiveFilter setValue:[CIVector vectorWithX:rtx Y:pixelH - rty] forKey:@"inputTopRight"];
+        [perspectiveFilter setValue:[CIVector vectorWithX:lbx Y:pixelH - lby] forKey:@"inputBottomLeft"];
+        [perspectiveFilter setValue:[CIVector vectorWithX:rbx Y:pixelH - rby] forKey:@"inputBottomRight"];
+        
+        // 渲染形变后的截图
+        CIImage *outputCIImage = perspectiveFilter.outputImage;
+        CIContext *ciContext = [CIContext contextWithOptions:nil];
+        CGImageRef cgTransformed = [ciContext createCGImage:outputCIImage fromRect:CGRectMake(0, 0, pixelW, pixelH)];
+        UIImage *transformedScreenshot = [UIImage imageWithCGImage:cgTransformed scale:1.0 orientation:UIImageOrientationUp];
+        CGImageRelease(cgTransformed);
+        
+        // 3. 最终画面合成
         if (@available(iOS 10.0, *)) {
             UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
-            // 🚨 致命关键点：强制比例为 1.0！绝对不能用默认的设备比例，否则大图直接引发系统内存 700MB 崩溃！
+            // 🚨 强制锁定 1.0 比例，绝对不能用设备默认的 @3x，这是彻底修复 OOM 内存崩溃的关键！
             format.scale = 1.0; 
-            format.opaque = NO; // 保留透明通道
+            format.opaque = NO; // 保留外壳透明通道
             
             UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(pixelW, pixelH) format:format];
             
             finalImage = [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull context) {
-                // 底层：画出原始截图（正好填满壳子的透明窟窿）
-                [rawScreenshot drawInRect:innerRect];
-                // 顶层：盖上手机壳（遮住截图中多余的部分和四角，展现边框）
+                // 底层：已被完美扭曲到 4 个坐标点的截图
+                [transformedScreenshot drawInRect:CGRectMake(0, 0, pixelW, pixelH)];
+                // 顶层：覆盖带有透明镂空区域的手机壳素材
                 [shellImage drawInRect:CGRectMake(0, 0, pixelW, pixelH)];
             }];
         }
@@ -110,13 +141,42 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     return finalImage ?: rawScreenshot;
 }
 
-
 // --------------------------------------------------------
-// 拦截相册的保存请求 (双保险)
+// Hook 拦截：接管截屏流与相册保存
 // --------------------------------------------------------
-%group PhotoSaveHook
+%group ScreenshotCoreHook
 
-// 拦截现代 iOS 通过内存 UIImage 直接写入相册的动作
+// 1. 拦截左下角悬浮窗
+%hook SSSScreenshot
+- (void)setBackingImage:(UIImage *)image {
+    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
+    if (image && prefs && [prefs[@"Enabled"] boolValue]) {
+        UIImage *shelledImage = applyShellToScreenshot(image);
+        if (shelledImage && shelledImage != image) {
+            
+            %orig(shelledImage);
+            
+            // 彻底粉碎系统的硬件级画面缓存，逼迫其使用我们套好壳的图片
+            SSEnvironmentDescription *envDesc = [self environmentDescription];
+            if (envDesc) {
+                if ([envDesc respondsToSelector:@selector(setImageSurface:)]) {
+                    [envDesc setImageSurface:nil];
+                }
+                if ([envDesc respondsToSelector:@selector(setImagePixelSize:)]) {
+                    [envDesc setImagePixelSize:shelledImage.size];
+                }
+                if ([envDesc respondsToSelector:@selector(setImageScale:)]) {
+                    [envDesc setImageScale:1.0];
+                }
+            }
+            return;
+        }
+    }
+    %orig(image);
+}
+%end
+
+// 2. 拦截相册的真实保存动作（双保险，防止系统静默绕过悬浮窗保存原图）
 %hook PHAssetCreationRequest
 + (instancetype)creationRequestForAssetFromImage:(UIImage *)image {
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
@@ -129,14 +189,13 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
     return %orig(image);
 }
 
-// 拦截 iOS 先写入临时文件，再存入相册的动作
 + (instancetype)creationRequestForAssetFromImageAtFileURL:(NSURL *)fileURL {
     NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
     if (prefs && [prefs[@"Enabled"] boolValue]) {
         UIImage *rawImage = [UIImage imageWithContentsOfFile:fileURL.path];
         UIImage *shelled = applyShellToScreenshot(rawImage);
         if (shelled && shelled != rawImage) {
-            // 将文件写入流劫持，改为直接写入合成好的内存图片，确保透明和套壳生效
+            // 如果系统企图用文件路径写入，我们拦截它并换成我们的内存套壳图片！
             return [self creationRequestForAssetFromImage:shelled];
         }
     }
@@ -144,60 +203,15 @@ static UIImage* applyShellToScreenshot(UIImage *rawScreenshot) {
 }
 %end
 
-%end // PhotoSaveHook
-
-// --------------------------------------------------------
-// 源头狙击钩子：控制悬浮窗 UI
-// --------------------------------------------------------
-%group ScreenshotUIHook
-
-%hook SSSScreenshotManager
-- (id)createScreenshotWithEnvironmentDescription:(id)env {
-    SSSScreenshot *screenshot = %orig(env);
-    
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:GetPlistPath()];
-    if (screenshot && prefs && [prefs[@"Enabled"] boolValue]) {
-        
-        UIImage *rawImage = [screenshot backingImage];
-        if (rawImage) {
-            UIImage *shelledImage = applyShellToScreenshot(rawImage);
-            
-            if (shelledImage && shelledImage != rawImage) {
-                // 1. 将套壳图塞回服务，悬浮窗立刻变样
-                [screenshot setBackingImage:shelledImage];
-                
-                // 2. 粉碎硬件缓存，逼迫系统展示并编辑我们的套壳图
-                SSEnvironmentDescription *envDesc = [screenshot environmentDescription];
-                if (envDesc) {
-                    if ([envDesc respondsToSelector:@selector(setImageSurface:)]) {
-                        [envDesc setImageSurface:nil];
-                    }
-                    if ([envDesc respondsToSelector:@selector(setImagePixelSize:)]) {
-                        [envDesc setImagePixelSize:shelledImage.size];
-                    }
-                    if ([envDesc respondsToSelector:@selector(setImageScale:)]) {
-                        // 配合上方的强制 1.0 缩放，骗过系统编辑器
-                        [envDesc setImageScale:1.0];
-                    }
-                }
-            }
-        }
-    }
-    
-    return screenshot;
-}
-%end
-
-%end // ScreenshotUIHook
+%end // ScreenshotCoreHook
 
 // --------------------------------------------------------
 // 构造入口
 // --------------------------------------------------------
 %ctor {
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
-    // ScreenshotServicesService 专门负责所有的截图后续流程和保存
-    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"]) {
-        %init(ScreenshotUIHook);
-        %init(PhotoSaveHook);
+    if ([bundleId isEqualToString:@"com.apple.ScreenshotServicesService"] ||
+        [bundleId isEqualToString:@"com.apple.springboard"]) {
+        %init(ScreenshotCoreHook);
     }
 }
