@@ -20,7 +20,6 @@
 @property (readonly, nonatomic) SSEnvironmentDescription *environmentDescription;
 @property (readonly, nonatomic) NSData *imageModificationData;
 - (void)requestImageInTransition:(BOOL)transition withBlock:(id)block;
-// 我们需要用到的底层状态方法
 - (BOOL)hasUnsavedImageEdits;
 - (BOOL)hasEverBeenEditedForMode:(long long)mode;
 @end
@@ -58,34 +57,20 @@ static BOOL isTweakEnabled(void) {
 }
 
 // --------------------------------------------------------
-// 读取素材
-// --------------------------------------------------------
-static UIImage *LoadShellImage(void) {
-    NSString *shellPath = [GetPrefDir() stringByAppendingPathComponent:@"shell.png"];
-    return [UIImage imageWithContentsOfFile:shellPath];
-}
-
-static NSDictionary *LoadConfig(void) {
-    NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
-    NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
-    if (!cfgData) return nil;
-
-    id json = [NSJSONSerialization JSONObjectWithData:cfgData options:0 error:nil];
-    if (![json isKindOfClass:[NSDictionary class]]) return nil;
-    return (NSDictionary *)json;
-}
-
-// --------------------------------------------------------
-// 核心绘图逻辑 (纯函数，不再包含标记逻辑)
+// 核心：读取并精确合成图像
 // --------------------------------------------------------
 static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
     if (!rawScreenshot) return nil;
 
-    UIImage *shellImage = LoadShellImage();
+    UIImage *shellImage = [UIImage imageWithContentsOfFile:[GetPrefDir() stringByAppendingPathComponent:@"shell.png"]];
     if (!shellImage) return rawScreenshot;
 
-    NSDictionary *cfg = LoadConfig();
-    if (!cfg) return rawScreenshot;
+    NSString *cfgPath = [GetPrefDir() stringByAppendingPathComponent:@"config.cfg"];
+    NSData *cfgData = [NSData dataWithContentsOfFile:cfgPath];
+    if (!cfgData) return rawScreenshot;
+
+    NSDictionary *cfg = [NSJSONSerialization JSONObjectWithData:cfgData options:0 error:nil];
+    if (![cfg isKindOfClass:[NSDictionary class]]) return rawScreenshot;
 
     CGFloat templateW = [cfg[@"template_width"] doubleValue];
     CGFloat templateH = [cfg[@"template_height"] doubleValue];
@@ -102,15 +87,13 @@ static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
 
     CGSize outSize = CGSizeMake(templateW, templateH);
 
+    // 重点：以 1.0 为比例绘图，保证 config 中的像素坐标一一对应
     UIGraphicsBeginImageContextWithOptions(outSize, NO, 1.0);
-    CGContextRef ctx = UIGraphicsGetCurrentContext();
-    if (ctx) {
-        CGContextClearRect(ctx, CGRectMake(0, 0, outSize.width, outSize.height));
-    }
-
-    // 1. 铺截图
+    
+    // 1. 先把原截图精准拉伸铺到洞里
     [rawScreenshot drawInRect:CGRectMake(ltx, lty, holeW, holeH)];
-    // 2. 盖外壳
+    
+    // 2. 再把壳盖上去
     [shellImage drawInRect:CGRectMake(0, 0, outSize.width, outSize.height)];
 
     UIImage *rendered = UIGraphicsGetImageFromCurrentImageContext();
@@ -118,7 +101,11 @@ static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
 
     if (!rendered) return rawScreenshot;
 
-    return [UIImage imageWithCGImage:rendered.CGImage scale:1.0 orientation:UIImageOrientationUp];
+    // 【极其关键】：把合成好的 CGImage 按原截图的 scale (如 3.0) 重新打包
+    // 否则会导致 iOS 截图编辑器坐标系错乱，图片无法正确显示或套准！
+    return [UIImage imageWithCGImage:rendered.CGImage
+                               scale:rawScreenshot.scale
+                         orientation:rawScreenshot.imageOrientation];
 }
 
 // --------------------------------------------------------
@@ -128,36 +115,59 @@ static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
 
 %hook SSSScreenshot
 
-// 【修复 Bug 1】：强制告诉系统“这张图我改过”，逼它走后续的渲染保存流程
+// 1. 欺骗系统：不管画没画，都强行要求系统走“保存修改后图片”的流程
 - (BOOL)hasUnsavedImageEdits {
-    if (isTweakEnabled()) {
-        return YES;
-    }
+    if (isTweakEnabled()) return YES;
     return %orig;
 }
 
 - (BOOL)hasEverBeenEditedForMode:(long long)mode {
-    if (isTweakEnabled()) {
-        return YES;
-    }
+    if (isTweakEnabled()) return YES;
     return %orig;
 }
 
-// 【修复 Bug 2】：在模型实例 (self) 上打标记，防套娃
+// 2. 最早介入：UI 小窗口获取图片时直接给套好的，顺便把最终模型替换掉
+- (void)requestImageInTransition:(BOOL)transition withBlock:(id)block {
+    if (!block || !isTweakEnabled()) {
+        %orig(transition, block);
+        return;
+    }
+
+    void (^origBlock)(id) = [block copy];
+    __weak typeof(self) weakSelf = self;
+    void (^wrappedBlock)(id) = ^(id image) {
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf && [image isKindOfClass:[UIImage class]]) {
+            // 防二次套娃标记
+            NSNumber *hasShelled = objc_getAssociatedObject(strongSelf, @selector(hasShelled));
+            if (![hasShelled boolValue]) {
+                UIImage *shelled = ApplyShellToScreenshot((UIImage *)image);
+                if (shelled && shelled != image) {
+                    [strongSelf setBackingImage:shelled]; // 替换底层原图
+                    objc_setAssociatedObject(strongSelf, @selector(hasShelled), @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    origBlock(shelled); // 交给小窗口预览
+                    return;
+                }
+            }
+        }
+        origBlock(image);
+    };
+
+    %orig(transition, wrappedBlock);
+}
+
+// 3. 模型获取图片时拦截（防漏洞兜底）
 - (UIImage *)backingImage {
     UIImage *orig = %orig;
     if (!orig || !isTweakEnabled()) return orig;
 
-    // 检查这个截图任务是否已经套过壳
     NSNumber *hasShelled = objc_getAssociatedObject(self, @selector(hasShelled));
     if ([hasShelled boolValue]) {
-        return orig; 
+        return orig;
     }
 
-    // 执行套壳
     UIImage *shelled = ApplyShellToScreenshot(orig);
     if (shelled && shelled != orig) {
-        // 关键：将套好壳的图片塞回模型，并打上永久标记
         [self setBackingImage:shelled];
         objc_setAssociatedObject(self, @selector(hasShelled), @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return shelled;
@@ -166,43 +176,24 @@ static UIImage *ApplyShellToScreenshot(UIImage *rawScreenshot) {
     return orig;
 }
 
-// 拦截 UI 预览时获取的图片，同步打上标记
-- (void)requestImageInTransition:(BOOL)transition withBlock:(id)block {
-    if (!block || !isTweakEnabled()) {
-        %orig(transition, block);
-        return;
+// 4. 关键：系统保存数据时的拦截
+- (NSData *)imageModificationData {
+    NSData *orig = %orig;
+    if (!isTweakEnabled()) return orig;
+
+    // 如果 orig 存在，说明用户真的画了一笔，此时系统已经把画过的界面生成了 PNG
+    // 因为在 requestImageInTransition 里用户就是对着套好壳的图画的，所以直接返回 orig 即可
+    if (orig) return orig;
+
+    // 如果 orig 为空，说明用户没动笔，但我们强行让 hasUnsavedImageEdits = YES 了
+    // 这时系统来要数据，我们必须把套好壳的图片强行转成 PNG 交给它保存
+    UIImage *shelledImage = [self backingImage]; 
+    if (shelledImage) {
+        return UIImagePNGRepresentation(shelledImage);
     }
 
-    NSNumber *hasShelled = objc_getAssociatedObject(self, @selector(hasShelled));
-    if ([hasShelled boolValue]) {
-        %orig(transition, block);
-        return;
-    }
-
-    void (^origBlock)(id) = [block copy];
-    // 使用 weakSelf 防止 Block 循环引用
-    __weak typeof(self) weakSelf = self;
-    void (^wrappedBlock)(id) = ^(id image) {
-        typeof(self) strongSelf = weakSelf;
-        if (strongSelf && [image isKindOfClass:[UIImage class]]) {
-            UIImage *shelled = ApplyShellToScreenshot((UIImage *)image);
-            if (shelled && shelled != image) {
-                [strongSelf setBackingImage:shelled];
-                objc_setAssociatedObject(strongSelf, @selector(hasShelled), @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                origBlock(shelled);
-            } else {
-                origBlock(image);
-            }
-        } else {
-            origBlock(image);
-        }
-    };
-
-    %orig(transition, wrappedBlock);
+    return nil;
 }
-
-// 注意：彻底删除了 imageModificationData 的 Hook。
-// 因为 backingImage 已经是套好壳的图片，原生系统会自己把它转成 NSData 并保存，多拦截一次必定会导致画中画！
 
 %end
 
